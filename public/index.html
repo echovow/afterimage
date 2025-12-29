@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>AFTERIMAGE</title>
+  <link rel="stylesheet" href="./css/style.css" />
+</head>
+<body>
+  <main id="app" aria-label="Afterimage game">
+    <canvas id="game" width="960" height="540" aria-label="Game canvas"></canvas>
+
+    <!-- Minimal overlay: readable, not intrusive -->
+    <div id="hud" role="status" aria-live="polite">
+      <div class="hud-left">
+        <div class="label">TIME</div>
+        <div id="time" class="value">0.00</div>
+      </div>
+
+      <div class="hud-right">
+        <div class="hint" id="hint">
+          <span class="key">WASD</span>/<span class="key">ARROWS</span> move ·
+          <span class="key">R</span> restart ·
+          <span class="key">SPACE</span> pause
+        </div>
+      </div>
+    </div>
+
+    <!-- Start / Death screen -->
+    <div id="overlay" class="overlay">
+      <div class="panel">
+        <div class="title">AFTERIMAGE</div>
+        <div class="subtitle">Your last seconds return. Survive yourself.</div>
+
+        <div class="rules">
+          <div class="rule"><span class="dot"></span> Every <span id="tLabel">5.0</span>s, an afterimage spawns.</div>
+          <div class="rule"><span class="dot"></span> It replays exactly what you did.</div>
+          <div class="rule"><span class="dot"></span> Touch one = end.</div>
+        </div>
+
+        <div class="cta">
+          <button id="btnStart" class="btn primary">PLAY</button>
+          <button id="btnHow" class="btn">HOW</button>
+        </div>
+
+        <div id="how" class="how hidden">
+          <p>
+            Move clean. Your motion becomes terrain.
+            The better you are, the denser the future gets.
+          </p>
+          <p class="small">
+            Tip: play smaller. Leave space for your ghosts.
+          </p>
+        </div>
+
+        <div class="footer small">
+          Built for web arcade. No RNG. No excuses.
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="./js/config.js"></script>
+  <script src="./js/main.js"></script>
+</body>
+</html>
