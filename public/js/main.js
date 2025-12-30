@@ -1,509 +1,611 @@
 (() => {
-  // AFTERIMAGE v3 — Rotating Spotlight Lanes (Modifier-only, No Drift)
-  // Prime Law: If you're not moving (no input intent), nothing moves you.
+  const CFG = window.CONFIG;
 
+  // -------- DOM
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d", { alpha: true });
 
-  // Optional UI (safe if missing)
   const els = {
     overlay: document.getElementById("overlay"),
-    hint: document.getElementById("hint"),
     btnStart: document.getElementById("btnStart"),
-    btnPump: document.getElementById("btnPump"),
+    btnHow: document.getElementById("btnHow"),
+    how: document.getElementById("how"),
+    time: document.getElementById("time"),
+    hint: document.getElementById("hint"),
+    tLabel: document.getElementById("tLabel"),
   };
 
-  const CFG = {
-    // Player
-    r: 10,
-    baseAccel: 0.75,
-    maxSpeed: 7.0,
-    friction: 0.92,
-
-    // Input (pointer pull behaves like intent; if you stop touching, player stops)
-    pointerPull: 1.0,
-    pointerDeadzone: 6,
-
-    // Lanes (spotlight bands)
-    laneCount: 3,
-    laneWidth: 90,           // px (soft edges drawn wider than this)
-    laneGap: 120,            // spacing between lane centerlines (perpendicular)
-    laneRotateSpeed: 0.12,   // radians per second (slow)
-    laneStrength: 0.55,      // overall influence on movement (modifier-only)
-    laneRampPer30s: 0.10,    // difficulty ramp
-    laneBoostMax: 1.55,      // max multiplier when aligned
-    laneResistMin: 0.55,     // min multiplier when opposing
-    laneCrossDrag: 0.90,     // multiplier when crossing (near perpendicular)
-
-    // Visuals
-    backgroundFade: 0.18,
-    vignette: true,
-
-    // Afterimage (v1-style: tied to movement)
-    trailMax: 34,
-    trailFade: 0.90,
-    trailAlphaBase: 0.10,
-    trailAlphaSpeed: 0.38,   // brighter trail at higher speed
-    trailMinMove: 0.10,      // only record trail when actually moving
-
-    // Overlay/link
-    pumpUrl: "https://pump.fun/",
-    title: "AFTERIMAGE",
-    lore: [
-      "Nothing moves you unless you move.",
-      "Ride the lane. Resist the lane.",
-      "Afterimage is proof of intent."
-    ],
+  // -------- Defaults for new systems (won’t require you to edit CONFIG)
+  const COLLECT = CFG.collect || {
+    momentRadius: 7,
+    basePoints: 100,
+    // combo multiplier: gentle & capped
+    comboStep: 0.35,     // +35% per streak step
+    comboCap: 10,        // cap streak contribution
+    // early-bonus rewards speed inside the same spawn window
+    earlyBonusMax: 0.55, // up to +55% if collected immediately after spawn
+    // spawn heuristics
+    minDistFromPlayer: 120,
+    minDistFromWalls: 30,
+    tries: 18,
+    // how strongly we prefer danger (near afterimages)
+    dangerBias: 0.78,
   };
 
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const lerp = (a, b, t) => a + (b - a) * t;
-  const hypot = Math.hypot;
+  // Show spawn interval label (existing UI)
+  if (els.tLabel) els.tLabel.textContent = CFG.gameplay.spawnEverySec.toFixed(1);
 
-  // ---------- Canvas sizing
-  let W = 0, H = 0, DPR = 1;
-  function resize() {
-    DPR = Math.min(2, window.devicePixelRatio || 1);
-    W = Math.floor(window.innerWidth);
-    H = Math.floor(window.innerHeight);
-    canvas.width = Math.floor(W * DPR);
-    canvas.height = Math.floor(H * DPR);
-    canvas.style.width = W + "px";
-    canvas.style.height = H + "px";
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // -------- Canvas sizing (crisp but capped DPR)
+  function resizeCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    state.view.w = rect.width;
+    state.view.h = rect.height;
+    state.view.dpr = dpr;
   }
-  window.addEventListener("resize", resize);
-  resize();
 
-  // ---------- State
+  // -------- State
   const state = {
-    running: false,
-    over: false,
-    paused: false,
+    view: { w: 0, h: 0, dpr: 1 },
     t: 0,
-    last: performance.now(),
+    last: 0,
+    paused: false,
+    dead: false,
 
+    spawnEvery: CFG.gameplay.spawnEverySec,
+    nextSpawnAt: CFG.gameplay.spawnEverySec,
+
+    // score system (new)
+    score: 0,
+    combo: 0,           // streak count
+    lastCollectAt: 0,   // for UI if desired
+
+    player: {
+      x: 0, y: 0,
+      vx: 0, vy: 0,
+      r: CFG.gameplay.playerRadius,
+    },
+
+    // Recorder: ring buffer of samples over recordWindowSec
+    recorder: {
+      maxSec: CFG.gameplay.recordWindowSec,
+      samples: [], // {t, x, y}
+    },
+
+    // Afterimages: each replays a recorded path loop
+    afterimages: [], // {samples:[{t,x,y}], duration, bornAt, idx, x, y}
+
+    // Moment collectible (new)
+    moment: {
+      active: false,
+      x: 0, y: 0,
+      bornAt: 0,
+      expiresAt: 0,    // EXACTLY next afterimage spawn time (B)
+      collected: false,
+    },
+
+    // input
     keys: new Set(),
-    pointerDown: false,
-    pointerX: 0,
-    pointerY: 0,
-
-    p: { x: W * 0.5, y: H * 0.5, vx: 0, vy: 0 },
-    trail: [],
+    pointer: { down: false, x: 0, y: 0 },
   };
 
-  // ---------- Overlay helpers
-  function showOverlay(on) {
+  // -------- Overlay controls
+  function showOverlay(show, deathText) {
     if (!els.overlay) return;
-    els.overlay.style.display = on ? "flex" : "none";
+    els.overlay.style.display = show ? "flex" : "none";
+    if (deathText && els.how) {
+      // reuse the "how" panel as subtitle if you want; safe if absent
+      els.how.style.display = "";
+      els.how.textContent = deathText;
+    }
   }
 
-  function setOverlayHome() {
-    if (!els.hint) return;
-    els.hint.innerHTML =
-      `<div style="opacity:.92;letter-spacing:.14em">${CFG.title}</div>
-       <div style="opacity:.70;margin-top:10px;line-height:1.5">${CFG.lore.join("<br>")}</div>
-       <div style="opacity:.52;margin-top:14px">WASD / Arrows • Mouse/Touch pull • R Restart</div>
-       <div style="opacity:.40;margin-top:8px">Tap/click to start</div>`;
+  function setHow(show) {
+    if (!els.how) return;
+    els.how.style.display = show ? "" : "none";
   }
 
-  function setOverlayGameOver() {
-    if (!els.hint) return;
-    els.hint.innerHTML =
-      `<div style="opacity:.92;letter-spacing:.14em">RUN ENDED</div>
-       <div style="opacity:.70;margin-top:10px">Time: <b>${state.t.toFixed(2)}s</b></div>
-       <div style="opacity:.52;margin-top:14px">Press R to restart</div>`;
+  if (els.btnHow) {
+    els.btnHow.addEventListener("click", () => {
+      const isOpen = els.how && els.how.style.display !== "none";
+      setHow(!isOpen);
+    });
   }
 
-  if (els.btnStart) els.btnStart.onclick = () => { resetRun(); showOverlay(false); };
-  if (els.btnPump)  els.btnPump.onclick  = () => window.open(CFG.pumpUrl, "_blank");
-
-  // ---------- Start/reset
-  function resetRun() {
-    state.running = true;
-    state.over = false;
-    state.paused = false;
-    state.t = 0;
-    state.p = { x: W * 0.5, y: H * 0.5, vx: 0, vy: 0 };
-    state.trail = [];
-  }
-
-  function gameOver() {
-    state.over = true;
-    state.running = false;
-    showOverlay(true);
-    setOverlayGameOver();
-  }
-
-  // ---------- Input
-  window.addEventListener("keydown", (e) => {
-    if (e.code === "KeyR") {
-      resetRun();
+  if (els.btnStart) {
+    els.btnStart.addEventListener("click", () => {
+      reset();
       showOverlay(false);
-      return;
-    }
-    if (!state.running && (e.code === "Enter" || e.code === "Space")) {
-      resetRun();
-      showOverlay(false);
-      return;
-    }
-    state.keys.add(e.code);
-  });
-
-  window.addEventListener("keyup", (e) => state.keys.delete(e.code));
-
-  canvas.addEventListener("pointerdown", (e) => {
-    state.pointerDown = true;
-    const rect = canvas.getBoundingClientRect();
-    state.pointerX = e.clientX - rect.left;
-    state.pointerY = e.clientY - rect.top;
-
-    if (!state.running) {
-      resetRun();
-      showOverlay(false);
-    }
-  });
-
-  window.addEventListener("pointermove", (e) => {
-    if (!state.pointerDown) return;
-    const rect = canvas.getBoundingClientRect();
-    state.pointerX = e.clientX - rect.left;
-    state.pointerY = e.clientY - rect.top;
-  });
-
-  window.addEventListener("pointerup", () => {
-    state.pointerDown = false;
-  });
-
-  // ---------- Lanes math (rotating bands, modifier-only)
-  function laneAngle(t) {
-    return t * CFG.laneRotateSpeed; // slow rotation
+    });
   }
 
-  // distance from point to a lane centerline (perpendicular axis)
-  // coordinate system: lane direction = (cos a, sin a)
-  // perpendicular axis = (-sin a, cos a)
-  function laneDistToCenterline(px, py, a, offset) {
-    const cx = W * 0.5;
-    const cy = H * 0.5;
-    const nx = -Math.sin(a);
-    const ny =  Math.cos(a);
+  // -------- Helpers
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function hypot(x, y) { return Math.hypot(x, y); }
 
-    // signed distance along normal from center
-    const d = (px - cx) * nx + (py - cy) * ny;
-
-    // lane centerlines at d = offset
-    return d - offset; // signed; abs() gives distance
+  function wallBounds() {
+    const pad = CFG.gameplay.wallPadding;
+    return {
+      minX: pad,
+      minY: pad,
+      maxX: state.view.w - pad,
+      maxY: state.view.h - pad,
+    };
   }
 
-  // lane modifier depends on:
-  // - inside band (proximity)
-  // - alignment between intent direction and lane direction
-  function laneModifier(intentX, intentY, px, py, t) {
-    // no intent -> no effect (prime law)
-    const im = hypot(intentX, intentY);
-    if (im < 1e-6) return 1;
+  function randBetween(a, b) {
+    return a + Math.random() * (b - a);
+  }
 
-    const a = laneAngle(t);
-    const fx = Math.cos(a);
-    const fy = Math.sin(a);
+  // -------- Recorder
+  function recordSample() {
+    const t = state.t;
+    const s = state.recorder.samples;
+    s.push({ t, x: state.player.x, y: state.player.y });
 
-    // alignment in [-1..1]
-    const ax = intentX / im;
-    const ay = intentY / im;
-    const align = ax * fx + ay * fy;
+    const cutoff = t - state.recorder.maxSec;
+    while (s.length && s[0].t < cutoff) s.shift();
+  }
 
-    // strongest lane influence among the lanes you're inside
-    let strength = 0;
+  // -------- Afterimages (core v1)
+  function spawnAfterimage() {
+    const s = state.recorder.samples;
+    if (s.length < 2) return;
 
-    const half = Math.floor(CFG.laneCount / 2);
-    for (let i = -half; i <= half; i++) {
-      const offset = i * CFG.laneGap;
-      const sd = laneDistToCenterline(px, py, a, offset);
-      const ad = Math.abs(sd);
+    const startT = s[0].t;
+    const duration = s[s.length - 1].t - startT;
+    if (duration <= 0.05) return;
 
-      // soft band: 0 at edge, 1 at center
-      const w = CFG.laneWidth * 0.5;
-      if (ad > w) continue;
+    const samples = s.map(p => ({
+      t: p.t - startT,
+      x: p.x,
+      y: p.y,
+    }));
 
-      const x = 1 - ad / w; // 0..1
-      // soften: quadratic
-      const local = x * x;
+    state.afterimages.push({
+      samples,
+      duration,
+      bornAt: state.t,
+      idx: 0,
+      x: samples[0].x,
+      y: samples[0].y,
+    });
+  }
 
-      strength = Math.max(strength, local);
-    }
+  function updateAfterimages() {
+    for (const g of state.afterimages) {
+      const local = (state.t - g.bornAt) % g.duration;
 
-    if (strength <= 0) return 1;
+      while (g.idx < g.samples.length - 2 && g.samples[g.idx + 1].t < local) {
+        g.idx++;
+      }
 
-    // ramp over time (gentle)
-    const sRamp = 1 + (state.t / 30) * CFG.laneRampPer30s;
-    const s = clamp(CFG.laneStrength * sRamp * strength, 0, 0.95);
+      const a = g.samples[g.idx];
+      const b = g.samples[Math.min(g.idx + 1, g.samples.length - 1)];
+      const span = Math.max(0.0001, b.t - a.t);
+      const u = clamp((local - a.t) / span, 0, 1);
 
-    // map alignment to movement multiplier:
-    // aligned -> boost up to laneBoostMax
-    // opposed -> resist down to laneResistMin
-    // cross -> slight drag laneCrossDrag
-    const absAlign = Math.abs(align);
-
-    // cross is near 0 alignment
-    if (absAlign < 0.25) {
-      // pull multiplier toward laneCrossDrag by s
-      return lerp(1, CFG.laneCrossDrag, s);
-    }
-
-    if (align > 0) {
-      // boost from 1 to laneBoostMax
-      return lerp(1, CFG.laneBoostMax, s * absAlign);
-    } else {
-      // resist from 1 down to laneResistMin
-      return lerp(1, CFG.laneResistMin, s * absAlign);
+      g.x = a.x + (b.x - a.x) * u;
+      g.y = a.y + (b.y - a.y) * u;
     }
   }
 
-  // ---------- Update loop (NO drift: lanes only modify your own acceleration)
-  function update(dt) {
-    if (!state.running || state.over || state.paused) return;
+  function collidePlayerWithAfterimages() {
+    const px = state.player.x, py = state.player.y, pr = state.player.r;
+    const rr = pr + pr;
+    const rr2 = rr * rr;
 
-    state.t += dt;
+    for (const g of state.afterimages) {
+      const dx = g.x - px;
+      const dy = g.y - py;
+      if (dx * dx + dy * dy <= rr2) return true;
+    }
+    return false;
+  }
 
-    // intent vector from keys + pointer pull (pointer is intent, not force)
-    let ix = 0, iy = 0;
+  // -------- Moment collectible (NEW)
+  // B rule: moment expires when the next afterimage spawns.
+  function expireMomentIfNeeded() {
+    if (!state.moment.active) return false;
+    if (state.t < state.moment.expiresAt) return false;
 
+    // Missed it => combo breaks
+    state.moment.active = false;
+    state.moment.collected = false;
+    if (state.combo > 0) state.combo = 0;
+    return true;
+  }
+
+  function dangerWeightedSpawn() {
+    const b = wallBounds();
+
+    // If there are no afterimages yet, spawn somewhere reasonably away from player.
+    const hasDanger = state.afterimages.length > 0;
+    const tries = COLLECT.tries;
+
+    for (let i = 0; i < tries; i++) {
+      let x, y;
+
+      const useDanger = hasDanger && Math.random() < COLLECT.dangerBias;
+
+      if (useDanger) {
+        // Pick a danger anchor: current afterimage positions (creates “temptation”)
+        const g = state.afterimages[Math.floor(Math.random() * state.afterimages.length)];
+
+        const ang = Math.random() * Math.PI * 2;
+        const dist = randBetween(state.player.r * 2.0, COLLECT.minDistFromPlayer * 1.35);
+
+        x = g.x + Math.cos(ang) * dist;
+        y = g.y + Math.sin(ang) * dist;
+      } else {
+        // fallback random
+        x = randBetween(b.minX, b.maxX);
+        y = randBetween(b.minY, b.maxY);
+      }
+
+      // clamp away from walls a bit
+      x = clamp(x, b.minX + COLLECT.minDistFromWalls, b.maxX - COLLECT.minDistFromWalls);
+      y = clamp(y, b.minY + COLLECT.minDistFromWalls, b.maxY - COLLECT.minDistFromWalls);
+
+      // keep it away from player so it’s not “free”
+      const dp = hypot(x - state.player.x, y - state.player.y);
+      if (dp < COLLECT.minDistFromPlayer) continue;
+
+      // also avoid spawning *on top* of an afterimage (too unfair / instant death)
+      let tooClose = false;
+      const mr = COLLECT.momentRadius + state.player.r + 10;
+      const mr2 = mr * mr;
+      for (const g2 of state.afterimages) {
+        const dx = g2.x - x;
+        const dy = g2.y - y;
+        if (dx * dx + dy * dy < mr2) { tooClose = true; break; }
+      }
+      if (tooClose) continue;
+
+      return { x, y };
+    }
+
+    // If all fails, just pick safe-ish random
+    return {
+      x: randBetween(b.minX + 40, b.maxX - 40),
+      y: randBetween(b.minY + 40, b.maxY - 40),
+    };
+  }
+
+  function spawnMoment() {
+    // Create a new moment for the next window
+    const pos = dangerWeightedSpawn();
+
+    state.moment.active = true;
+    state.moment.collected = false;
+    state.moment.x = pos.x;
+    state.moment.y = pos.y;
+    state.moment.bornAt = state.t;
+    state.moment.expiresAt = state.nextSpawnAt; // B: expires exactly at next spawn
+  }
+
+  function tryCollectMoment() {
+    if (!state.moment.active) return;
+
+    const dx = state.player.x - state.moment.x;
+    const dy = state.player.y - state.moment.y;
+    const rr = state.player.r + COLLECT.momentRadius;
+    if (dx * dx + dy * dy > rr * rr) return;
+
+    // collected
+    state.moment.active = false;
+    state.moment.collected = true;
+    state.lastCollectAt = state.t;
+
+    // combo increments (streak of successful windows)
+    state.combo += 1;
+
+    // combo multiplier (gentle, capped)
+    const streak = Math.min(state.combo, COLLECT.comboCap);
+    const comboMult = 1 + (streak - 1) * COLLECT.comboStep;
+
+    // early bonus: rewards quick collection inside the same window
+    const window = Math.max(0.0001, state.moment.expiresAt - state.moment.bornAt);
+    const fracLeft = clamp((state.moment.expiresAt - state.t) / window, 0, 1);
+    const earlyMult = 1 + fracLeft * COLLECT.earlyBonusMax;
+
+    const pts = Math.round(COLLECT.basePoints * comboMult * earlyMult);
+    state.score += pts;
+  }
+
+  // -------- Input → movement
+  function axisFromKeys() {
     const k = state.keys;
-    if (k.has("ArrowLeft") || k.has("KeyA")) ix -= 1;
-    if (k.has("ArrowRight") || k.has("KeyD")) ix += 1;
-    if (k.has("ArrowUp") || k.has("KeyW")) iy -= 1;
-    if (k.has("ArrowDown") || k.has("KeyS")) iy += 1;
+    const ax = {
+      x: (k.has("ArrowRight") || k.has("KeyD") ? 1 : 0) - (k.has("ArrowLeft") || k.has("KeyA") ? 1 : 0),
+      y: (k.has("ArrowDown") || k.has("KeyS") ? 1 : 0) - (k.has("ArrowUp") || k.has("KeyW") ? 1 : 0),
+    };
 
-    // normalize keyboard intent
-    let km = hypot(ix, iy);
-    if (km > 0) { ix /= km; iy /= km; }
-
-    // pointer pull intent (adds to intent direction)
-    if (state.pointerDown) {
-      const dx = state.pointerX - state.p.x;
-      const dy = state.pointerY - state.p.y;
+    // pointer drag: acts like intent joystick
+    if (state.pointer.down) {
+      const dx = state.pointer.x - state.player.x;
+      const dy = state.pointer.y - state.player.y;
       const d = hypot(dx, dy);
-
-      if (d > CFG.pointerDeadzone) {
-        const pull = clamp(d / 220, 0, 1);
-        ix += (dx / d) * pull * CFG.pointerPull;
-        iy += (dy / d) * pull * CFG.pointerPull;
+      if (d > 12) {
+        ax.x += dx / d;
+        ax.y += dy / d;
       }
     }
 
-    const im = hypot(ix, iy);
-
-    // PRIME LAW: no intent => stop completely (no drift, no residual slide)
-    if (im < 1e-4) {
-      state.p.vx = 0;
-      state.p.vy = 0;
-      return; // also do not add trail
-    }
-
-    // normalize combined intent
-    ix /= im;
-    iy /= im;
-
-    // compute lane movement modifier (only because you are moving)
-    const mod = laneModifier(ix, iy, state.p.x, state.p.y, state.t);
-
-    // accelerate in the direction you chose, scaled by lane modifier
-    state.p.vx += ix * CFG.baseAccel * mod;
-    state.p.vy += iy * CFG.baseAccel * mod;
-
-    // clamp speed
-    const sp = hypot(state.p.vx, state.p.vy);
-    if (sp > CFG.maxSpeed) {
-      state.p.vx = (state.p.vx / sp) * CFG.maxSpeed;
-      state.p.vy = (state.p.vy / sp) * CFG.maxSpeed;
-    }
-
-    // friction only applies while moving (still respects prime law because we already early-return on no intent)
-    state.p.vx *= CFG.friction;
-    state.p.vy *= CFG.friction;
-
-    // move
-    state.p.x += state.p.vx;
-    state.p.y += state.p.vy;
-
-    // bounds (soft bounce, but still fully under your control)
-    const r = CFG.r;
-    if (state.p.x < r) { state.p.x = r; state.p.vx *= -0.45; }
-    if (state.p.x > W - r) { state.p.x = W - r; state.p.vx *= -0.45; }
-    if (state.p.y < r) { state.p.y = r; state.p.vy *= -0.45; }
-    if (state.p.y > H - r) { state.p.y = H - r; state.p.vy *= -0.45; }
-
-    // Afterimage trail (v1 behavior: tied to motion + speed intensity)
-    const sp2 = hypot(state.p.vx, state.p.vy);
-    if (sp2 > CFG.trailMinMove) {
-      const speed01 = clamp(sp2 / (CFG.maxSpeed * 0.85), 0, 1);
-      const a = CFG.trailAlphaBase + speed01 * CFG.trailAlphaSpeed;
-
-      state.trail.unshift({ x: state.p.x, y: state.p.y, a });
-      if (state.trail.length > CFG.trailMax) state.trail.pop();
-      for (const t of state.trail) t.a *= CFG.trailFade;
-    }
+    const m = hypot(ax.x, ax.y);
+    if (m > 0.001) { ax.x /= m; ax.y /= m; }
+    return ax;
   }
 
-  // ---------- Render
-  function draw() {
-    // clear with slight fade for softness (doesn't create drift; purely visual)
-    ctx.save();
-    ctx.globalAlpha = 1;
-    ctx.clearRect(0, 0, W, H);
-    ctx.restore();
+  function updatePlayer(dt) {
+    const ax = axisFromKeys();
 
-    // subtle background wash
-    ctx.save();
-    ctx.globalAlpha = CFG.backgroundFade;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, W, H);
-    ctx.restore();
+    const spd = CFG.gameplay.playerSpeed;
+    state.player.vx = ax.x * spd;
+    state.player.vy = ax.y * spd;
 
-    // Lanes (elegant spotlight bands)
-    drawLanes();
+    state.player.x += state.player.vx * dt;
+    state.player.y += state.player.vy * dt;
 
-    // Afterimage trail (v1)
-    ctx.save();
-    for (let i = state.trail.length - 1; i >= 0; i--) {
-      const t = state.trail[i];
-      const rr = CFG.r * (0.92 + i * 0.012);
-      ctx.globalAlpha = t.a * (0.95 - i / (CFG.trailMax * 1.25));
-      ctx.beginPath();
-      ctx.arc(t.x, t.y, rr, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(255,255,255,0.98)";
-      ctx.fill();
+    const b = wallBounds();
+    state.player.x = clamp(state.player.x, b.minX, b.maxX);
+    state.player.y = clamp(state.player.y, b.minY, b.maxY);
+  }
+
+  // -------- Game loop
+  function reset() {
+    resizeCanvas();
+    state.t = 0;
+    state.last = performance.now();
+    state.paused = false;
+    state.dead = false;
+
+    state.afterimages = [];
+    state.recorder.samples = [];
+
+    state.spawnEvery = CFG.gameplay.spawnEverySec;
+    state.nextSpawnAt = state.spawnEvery;
+
+    state.score = 0;
+    state.combo = 0;
+
+    state.moment.active = false;
+    state.moment.collected = false;
+
+    state.player.x = state.view.w * 0.5;
+    state.player.y = state.view.h * 0.5;
+    state.player.vx = 0;
+    state.player.vy = 0;
+
+    if (els.hint && CFG.ui.showHintDuringPlay) els.hint.style.display = "";
+  }
+
+  function die() {
+    state.dead = true;
+    showOverlay(true, `You touched your past.\nScore: ${state.score}  •  Combo: ${state.combo}`);
+    if (els.hint) els.hint.style.display = "none";
+  }
+
+  function update(dt) {
+    if (state.paused || state.dead) return;
+
+    state.t += dt;
+
+    // Window expiry BEFORE spawn (so missing breaks combo cleanly)
+    expireMomentIfNeeded();
+
+    // Spawn afterimage + new moment at cadence
+    if (state.t >= state.nextSpawnAt) {
+      // If moment is still active here, it just expired => combo already broken above
+      spawnAfterimage();
+
+      // next window
+      state.nextSpawnAt = state.t + state.spawnEvery;
+
+      // optional ramp: tighten cadence over time (keeps runs finite)
+      if (CFG.gameplay.rampEnabled) {
+        state.spawnEvery = Math.max(
+          CFG.gameplay.spawnEveryMinSec,
+          state.spawnEvery - CFG.gameplay.rampDeltaSec
+        );
+      }
+      if (els.tLabel) els.tLabel.textContent = state.spawnEvery.toFixed(1);
+
+      // spawn a fresh moment for THIS new window
+      spawnMoment();
     }
-    ctx.restore();
 
-    // Player
+    updateAfterimages();
+    updatePlayer(dt);
+
+    // record movement for upcoming afterimage
+    recordSample();
+
+    // moment collection check
+    tryCollectMoment();
+
+    // collision
+    if (collidePlayerWithAfterimages()) die();
+  }
+
+  // -------- Render
+  function clear() {
+    ctx.clearRect(0, 0, state.view.w, state.view.h);
+  }
+
+  function drawArena() {
+    const b = wallBounds();
     ctx.save();
-    ctx.globalAlpha = 0.92;
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = "rgba(233,237,243,.12)";
+    ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.arc(state.p.x, state.p.y, CFG.r, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255,255,255,0.98)";
-    ctx.fill();
+    ctx.roundRect(b.minX - 14, b.minY - 14, (b.maxX - b.minX) + 28, (b.maxY - b.minY) + 28, 18);
+    ctx.stroke();
     ctx.restore();
-
-    if (CFG.vignette) drawVignette();
-
-    // Minimal HUD (time)
-    drawHud();
   }
 
-  function drawLanes() {
-    const a = laneAngle(state.t);
-    const fx = Math.cos(a);
-    const fy = Math.sin(a);
-    const nx = -Math.sin(a);
-    const ny =  Math.cos(a);
-
-    // lane visibility should be quiet and “wake up” with movement
-    const sp = hypot(state.p.vx, state.p.vy);
-    const vis = clamp(sp / (CFG.maxSpeed * 0.7), 0, 1);
-
-    // draw each lane as a wide rect rotated by angle a, with a soft gradient across its width
-    const half = Math.floor(CFG.laneCount / 2);
-    for (let i = -half; i <= half; i++) {
-      const offset = i * CFG.laneGap;
-
-      // lane centerline point (center + normal * offset)
-      const cx = W * 0.5 + nx * offset;
-      const cy = H * 0.5 + ny * offset;
-
-      // gradient across normal direction (soft spotlight)
-      const w = CFG.laneWidth;
-      const gx1 = cx - nx * (w * 0.5);
-      const gy1 = cy - ny * (w * 0.5);
-      const gx2 = cx + nx * (w * 0.5);
-      const gy2 = cy + ny * (w * 0.5);
-
-      const grad = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
-      // edges nearly invisible
-      const edgeA = 0.0;
-      // center wakes up with motion
-      const midA = 0.08 + 0.22 * vis;
-
-      grad.addColorStop(0, `rgba(255,255,255,${edgeA})`);
-      grad.addColorStop(0.5, `rgba(255,255,255,${midA})`);
-      grad.addColorStop(1, `rgba(255,255,255,${edgeA})`);
-
-      // big rotated quad covering screen along lane direction
-      // We draw a very long rectangle aligned with f, centered at (cx,cy)
-      const L = Math.max(W, H) * 1.6;
-      const hx = fx * (L * 0.5);
-      const hy = fy * (L * 0.5);
-      const wx = nx * (w * 0.5);
-      const wy = ny * (w * 0.5);
-
-      const p1x = cx - hx - wx, p1y = cy - hy - wy;
-      const p2x = cx + hx - wx, p2y = cy + hy - wy;
-      const p3x = cx + hx + wx, p3y = cy + hy + wy;
-      const p4x = cx - hx + wx, p4y = cy - hy + wy;
-
+  function drawAfterimages() {
+    for (const g of state.afterimages) {
       ctx.save();
-      ctx.globalCompositeOperation = "screen";
-      ctx.fillStyle = grad;
+      ctx.globalAlpha = 0.18;
+      ctx.fillStyle = "rgba(233,237,243,1)";
       ctx.beginPath();
-      ctx.moveTo(p1x, p1y);
-      ctx.lineTo(p2x, p2y);
-      ctx.lineTo(p3x, p3y);
-      ctx.lineTo(p4x, p4y);
-      ctx.closePath();
+      ctx.arc(g.x, g.y, state.player.r, 0, Math.PI * 2);
       ctx.fill();
+
+      ctx.globalAlpha = 0.08;
+      ctx.strokeStyle = "rgba(233,237,243,1)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, state.player.r + 3, 0, Math.PI * 2);
+      ctx.stroke();
+
       ctx.restore();
     }
   }
 
-  function drawVignette() {
-    const g = ctx.createRadialGradient(
-      W * 0.5, H * 0.5, Math.min(W, H) * 0.18,
-      W * 0.5, H * 0.5, Math.max(W, H) * 0.75
-    );
-    g.addColorStop(0, "rgba(0,0,0,0)");
-    g.addColorStop(1, "rgba(0,0,0,0.62)");
+  function drawMoment() {
+    if (!state.moment.active) return;
+
+    const r = COLLECT.momentRadius;
+    const pulse = 0.5 + 0.5 * Math.sin(state.t * 6.0);
+    const a = 0.55 + 0.25 * pulse;
+
+    // subtle “glyph” diamond (quiet, readable)
     ctx.save();
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, W, H);
+    ctx.translate(state.moment.x, state.moment.y);
+
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = "rgba(233,237,243,1)";
+    ctx.lineWidth = 1.5;
+
+    ctx.beginPath();
+    ctx.moveTo(0, -r - 2);
+    ctx.lineTo(r + 2, 0);
+    ctx.lineTo(0, r + 2);
+    ctx.lineTo(-r - 2, 0);
+    ctx.closePath();
+    ctx.stroke();
+
+    // tiny core
+    ctx.globalAlpha = a * 0.8;
+    ctx.fillStyle = "rgba(233,237,243,1)";
+    ctx.beginPath();
+    ctx.arc(0, 0, 1.8 + pulse * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.restore();
   }
 
-  function drawHud() {
+  function drawPlayer() {
+    const p = state.player;
+
     ctx.save();
-    ctx.globalAlpha = 0.75;
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.fillStyle = "rgba(255,255,255,0.82)";
-    ctx.fillText("TIME", 14, 16);
-    ctx.globalAlpha = 0.92;
-    ctx.font = "22px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.fillText(state.t.toFixed(2), 14, 40);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "rgba(233,237,243,1)";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // subtle halo
+    ctx.globalAlpha = 0.08;
+    ctx.strokeStyle = "rgba(233,237,243,1)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r + 8, 0, Math.PI * 2);
+    ctx.stroke();
+
     ctx.restore();
   }
 
-  // ---------- Loop
-  function frame(now) {
+  function render() {
+    clear();
+    drawArena();
+    drawAfterimages();
+    drawMoment();
+    drawPlayer();
+
+    // HUD text (keep it compact)
+    const timeStr = state.t.toFixed(2);
+    const comboStr = state.combo > 0 ? `x${state.combo}` : "—";
+    if (els.time) els.time.textContent = `${timeStr}  •  ${state.score}  •  ${comboStr}`;
+
+    // paused veil
+    if (state.paused && !state.dead) {
+      ctx.save();
+      ctx.fillStyle = "rgba(0,0,0,.35)";
+      ctx.fillRect(0, 0, state.view.w, state.view.h);
+      ctx.fillStyle = "rgba(233,237,243,.85)";
+      ctx.font = "600 18px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.textAlign = "center";
+      ctx.fillText("PAUSED", state.view.w / 2, state.view.h / 2);
+      ctx.restore();
+    }
+  }
+
+  // -------- Events
+  window.addEventListener("resize", () => resizeCanvas());
+
+  window.addEventListener("keydown", (e) => {
+    const k = e.code;
+
+    if (k === "KeyR") {
+      reset();
+      showOverlay(false);
+      return;
+    }
+
+    if (k === "Space") {
+      state.paused = !state.paused;
+      e.preventDefault();
+      return;
+    }
+
+    state.keys.add(k);
+  });
+
+  window.addEventListener("keyup", (e) => {
+    state.keys.delete(e.code);
+  });
+
+  canvas.addEventListener("pointerdown", (e) => {
+    state.pointer.down = true;
+    const rect = canvas.getBoundingClientRect();
+    state.pointer.x = e.clientX - rect.left;
+    state.pointer.y = e.clientY - rect.top;
+  });
+
+  window.addEventListener("pointermove", (e) => {
+    if (!state.pointer.down) return;
+    const rect = canvas.getBoundingClientRect();
+    state.pointer.x = e.clientX - rect.left;
+    state.pointer.y = e.clientY - rect.top;
+  });
+
+  window.addEventListener("pointerup", () => {
+    state.pointer.down = false;
+  });
+
+  // -------- RAF
+  function tick(now) {
+    if (!state.last) state.last = now;
     const dt = clamp((now - state.last) / 1000, 0, 0.033);
     state.last = now;
+
     update(dt);
-    draw();
-    requestAnimationFrame(frame);
+    render();
+
+    requestAnimationFrame(tick);
   }
 
-  // ---------- Boot
+  // -------- Boot
+  resizeCanvas();
   showOverlay(true);
-  setOverlayHome();
-
-  // Tap/click canvas to start if overlay lacks buttons
-  canvas.addEventListener("click", () => {
-    if (!state.running) {
-      resetRun();
-      showOverlay(false);
-    }
-  });
-
-  requestAnimationFrame((t) => {
-    state.last = t;
-    requestAnimationFrame(frame);
-  });
+  setHow(true);
+  requestAnimationFrame(tick);
 })();
