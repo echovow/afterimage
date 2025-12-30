@@ -7,7 +7,7 @@
 
   const els = {
     overlay: document.getElementById("overlay"),
-    btnStart: document.getElementById("btnStart"),
+    btnStart: document.getElementById("btnStart"), // optional legacy
     btnHow: document.getElementById("btnHow"),
     how: document.getElementById("how"),
     time: document.getElementById("time"),
@@ -15,27 +15,82 @@
     tLabel: document.getElementById("tLabel"),
   };
 
-  // -------- Defaults for new systems (won’t require you to edit CONFIG)
+  // -------- Modes (Signal = base, Pressure = phase compression)
+  // Keep Signal as the exact baseline: replay speed multiplier = 1.0 always
+  const MODES = {
+    signal: {
+      name: "SIGNAL",
+      phaseCompression: false,
+    },
+    pressure: {
+      name: "PRESSURE",
+      phaseCompression: true,
+      // Phase compression knobs:
+      // - rampPerSec: how fast replay speed increases per second of real time
+      // - maxMult: cap for fairness
+      // - graceSec: initial calm before ramp engages (optional)
+      rampPerSec: 0.0045, // ~ +0.27x per minute (0.0045*60=0.27)
+      maxMult: 1.55,
+      graceSec: 8,
+    },
+  };
+
+  // Score/collect system (v1.5)
   const COLLECT = CFG.collect || {
     momentRadius: 7,
     basePoints: 100,
-    // combo multiplier: gentle & capped
-    comboStep: 0.35,     // +35% per streak step
-    comboCap: 10,        // cap streak contribution
-    // early-bonus rewards speed inside the same spawn window
-    earlyBonusMax: 0.55, // up to +55% if collected immediately after spawn
-    // spawn heuristics
+    comboStep: 0.35,
+    comboCap: 10,
+    earlyBonusMax: 0.55,
     minDistFromPlayer: 120,
     minDistFromWalls: 30,
     tries: 18,
-    // how strongly we prefer danger (near afterimages)
     dangerBias: 0.78,
   };
 
-  // Show spawn interval label (existing UI)
-  if (els.tLabel) els.tLabel.textContent = CFG.gameplay.spawnEverySec.toFixed(1);
+  // -------- State
+  const state = {
+    view: { w: 0, h: 0, dpr: 1 },
+    t: 0,
+    last: 0,
+    paused: false,
+    dead: false,
 
-  // -------- Canvas sizing (crisp but capped DPR)
+    // mode
+    modeKey: "signal",
+    mode: MODES.signal,
+
+    spawnEvery: CFG.gameplay.spawnEverySec,
+    nextSpawnAt: CFG.gameplay.spawnEverySec,
+
+    score: 0,
+    combo: 0,
+
+    player: {
+      x: 0, y: 0,
+      vx: 0, vy: 0,
+      r: CFG.gameplay.playerRadius,
+    },
+
+    recorder: {
+      maxSec: CFG.gameplay.recordWindowSec,
+      samples: [],
+    },
+
+    afterimages: [], // {samples, duration, bornAt, idx, x, y}
+
+    moment: {
+      active: false,
+      x: 0, y: 0,
+      bornAt: 0,
+      expiresAt: 0, // B: expires exactly at next spawn
+    },
+
+    keys: new Set(),
+    pointer: { down: false, x: 0, y: 0 },
+  };
+
+  // -------- Canvas sizing
   function resizeCanvas() {
     const rect = canvas.getBoundingClientRect();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -48,60 +103,57 @@
     state.view.dpr = dpr;
   }
 
-  // -------- State
-  const state = {
-    view: { w: 0, h: 0, dpr: 1 },
-    t: 0,
-    last: 0,
-    paused: false,
-    dead: false,
+  // -------- Overlay: create mode buttons if needed
+  function ensureModeButtons() {
+    if (!els.overlay) return;
 
-    spawnEvery: CFG.gameplay.spawnEverySec,
-    nextSpawnAt: CFG.gameplay.spawnEverySec,
+    // If already present, do nothing
+    if (document.getElementById("btnSignal") && document.getElementById("btnPressure")) return;
 
-    // score system (new)
-    score: 0,
-    combo: 0,           // streak count
-    lastCollectAt: 0,   // for UI if desired
+    // Make a simple container
+    const box = document.createElement("div");
+    box.style.display = "flex";
+    box.style.flexDirection = "column";
+    box.style.gap = "10px";
+    box.style.alignItems = "center";
+    box.style.marginTop = "14px";
 
-    player: {
-      x: 0, y: 0,
-      vx: 0, vy: 0,
-      r: CFG.gameplay.playerRadius,
-    },
+    const mkBtn = (id, text) => {
+      const b = document.createElement("button");
+      b.id = id;
+      b.textContent = text;
+      b.style.cursor = "pointer";
+      b.style.padding = "10px 14px";
+      b.style.borderRadius = "12px";
+      b.style.border = "1px solid rgba(233,237,243,.25)";
+      b.style.background = "rgba(0,0,0,.35)";
+      b.style.color = "rgba(233,237,243,.92)";
+      b.style.font = "600 14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      b.style.letterSpacing = ".08em";
+      b.onmouseenter = () => (b.style.background = "rgba(233,237,243,.10)");
+      b.onmouseleave = () => (b.style.background = "rgba(0,0,0,.35)");
+      return b;
+    };
 
-    // Recorder: ring buffer of samples over recordWindowSec
-    recorder: {
-      maxSec: CFG.gameplay.recordWindowSec,
-      samples: [], // {t, x, y}
-    },
+    const btnSignal = mkBtn("btnSignal", "START — SIGNAL (BASE)");
+    const btnPressure = mkBtn("btnPressure", "START — PRESSURE (PHASE)");
 
-    // Afterimages: each replays a recorded path loop
-    afterimages: [], // {samples:[{t,x,y}], duration, bornAt, idx, x, y}
+    box.appendChild(btnSignal);
+    box.appendChild(btnPressure);
 
-    // Moment collectible (new)
-    moment: {
-      active: false,
-      x: 0, y: 0,
-      bornAt: 0,
-      expiresAt: 0,    // EXACTLY next afterimage spawn time (B)
-      collected: false,
-    },
+    els.overlay.appendChild(box);
 
-    // input
-    keys: new Set(),
-    pointer: { down: false, x: 0, y: 0 },
-  };
+    btnSignal.addEventListener("click", () => {
+      startWithMode("signal");
+    });
+    btnPressure.addEventListener("click", () => {
+      startWithMode("pressure");
+    });
+  }
 
-  // -------- Overlay controls
-  function showOverlay(show, deathText) {
+  function showOverlay(show) {
     if (!els.overlay) return;
     els.overlay.style.display = show ? "flex" : "none";
-    if (deathText && els.how) {
-      // reuse the "how" panel as subtitle if you want; safe if absent
-      els.how.style.display = "";
-      els.how.textContent = deathText;
-    }
   }
 
   function setHow(show) {
@@ -116,16 +168,15 @@
     });
   }
 
+  // Legacy single start button (optional)
   if (els.btnStart) {
-    els.btnStart.addEventListener("click", () => {
-      reset();
-      showOverlay(false);
-    });
+    els.btnStart.addEventListener("click", () => startWithMode("signal"));
   }
 
   // -------- Helpers
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
   function hypot(x, y) { return Math.hypot(x, y); }
+  function randBetween(a, b) { return a + Math.random() * (b - a); }
 
   function wallBounds() {
     const pad = CFG.gameplay.wallPadding;
@@ -135,10 +186,6 @@
       maxX: state.view.w - pad,
       maxY: state.view.h - pad,
     };
-  }
-
-  function randBetween(a, b) {
-    return a + Math.random() * (b - a);
   }
 
   // -------- Recorder
@@ -151,7 +198,7 @@
     while (s.length && s[0].t < cutoff) s.shift();
   }
 
-  // -------- Afterimages (core v1)
+  // -------- Spawn afterimage
   function spawnAfterimage() {
     const s = state.recorder.samples;
     if (s.length < 2) return;
@@ -176,9 +223,22 @@
     });
   }
 
+  // -------- Phase compression: compute replay speed multiplier
+  function replaySpeedMult() {
+    if (!state.mode.phaseCompression) return 1.0;
+    const m = state.mode;
+
+    const tEff = Math.max(0, state.t - (m.graceSec || 0));
+    const mult = 1.0 + tEff * (m.rampPerSec || 0);
+    return clamp(mult, 1.0, m.maxMult || 1.5);
+  }
+
   function updateAfterimages() {
+    const speed = replaySpeedMult();
+
     for (const g of state.afterimages) {
-      const local = (state.t - g.bornAt) % g.duration;
+      // 핵심: local time runs faster under phase compression
+      const local = ((state.t - g.bornAt) * speed) % g.duration;
 
       while (g.idx < g.samples.length - 2 && g.samples[g.idx + 1].t < local) {
         g.idx++;
@@ -207,55 +267,43 @@
     return false;
   }
 
-  // -------- Moment collectible (NEW)
-  // B rule: moment expires when the next afterimage spawns.
+  // -------- Moment (B expiry)
   function expireMomentIfNeeded() {
     if (!state.moment.active) return false;
     if (state.t < state.moment.expiresAt) return false;
 
-    // Missed it => combo breaks
     state.moment.active = false;
-    state.moment.collected = false;
     if (state.combo > 0) state.combo = 0;
     return true;
   }
 
   function dangerWeightedSpawn() {
     const b = wallBounds();
-
-    // If there are no afterimages yet, spawn somewhere reasonably away from player.
     const hasDanger = state.afterimages.length > 0;
-    const tries = COLLECT.tries;
 
-    for (let i = 0; i < tries; i++) {
+    for (let i = 0; i < COLLECT.tries; i++) {
       let x, y;
 
       const useDanger = hasDanger && Math.random() < COLLECT.dangerBias;
 
       if (useDanger) {
-        // Pick a danger anchor: current afterimage positions (creates “temptation”)
         const g = state.afterimages[Math.floor(Math.random() * state.afterimages.length)];
-
         const ang = Math.random() * Math.PI * 2;
         const dist = randBetween(state.player.r * 2.0, COLLECT.minDistFromPlayer * 1.35);
-
         x = g.x + Math.cos(ang) * dist;
         y = g.y + Math.sin(ang) * dist;
       } else {
-        // fallback random
         x = randBetween(b.minX, b.maxX);
         y = randBetween(b.minY, b.maxY);
       }
 
-      // clamp away from walls a bit
       x = clamp(x, b.minX + COLLECT.minDistFromWalls, b.maxX - COLLECT.minDistFromWalls);
       y = clamp(y, b.minY + COLLECT.minDistFromWalls, b.maxY - COLLECT.minDistFromWalls);
 
-      // keep it away from player so it’s not “free”
       const dp = hypot(x - state.player.x, y - state.player.y);
       if (dp < COLLECT.minDistFromPlayer) continue;
 
-      // also avoid spawning *on top* of an afterimage (too unfair / instant death)
+      // avoid instant unfair overlap with ghosts
       let tooClose = false;
       const mr = COLLECT.momentRadius + state.player.r + 10;
       const mr2 = mr * mr;
@@ -269,7 +317,6 @@
       return { x, y };
     }
 
-    // If all fails, just pick safe-ish random
     return {
       x: randBetween(b.minX + 40, b.maxX - 40),
       y: randBetween(b.minY + 40, b.maxY - 40),
@@ -277,15 +324,12 @@
   }
 
   function spawnMoment() {
-    // Create a new moment for the next window
     const pos = dangerWeightedSpawn();
-
     state.moment.active = true;
-    state.moment.collected = false;
     state.moment.x = pos.x;
     state.moment.y = pos.y;
     state.moment.bornAt = state.t;
-    state.moment.expiresAt = state.nextSpawnAt; // B: expires exactly at next spawn
+    state.moment.expiresAt = state.nextSpawnAt; // B: expires at next spawn
   }
 
   function tryCollectMoment() {
@@ -296,19 +340,12 @@
     const rr = state.player.r + COLLECT.momentRadius;
     if (dx * dx + dy * dy > rr * rr) return;
 
-    // collected
     state.moment.active = false;
-    state.moment.collected = true;
-    state.lastCollectAt = state.t;
-
-    // combo increments (streak of successful windows)
     state.combo += 1;
 
-    // combo multiplier (gentle, capped)
     const streak = Math.min(state.combo, COLLECT.comboCap);
     const comboMult = 1 + (streak - 1) * COLLECT.comboStep;
 
-    // early bonus: rewards quick collection inside the same window
     const window = Math.max(0.0001, state.moment.expiresAt - state.moment.bornAt);
     const fracLeft = clamp((state.moment.expiresAt - state.t) / window, 0, 1);
     const earlyMult = 1 + fracLeft * COLLECT.earlyBonusMax;
@@ -325,7 +362,6 @@
       y: (k.has("ArrowDown") || k.has("KeyS") ? 1 : 0) - (k.has("ArrowUp") || k.has("KeyW") ? 1 : 0),
     };
 
-    // pointer drag: acts like intent joystick
     if (state.pointer.down) {
       const dx = state.pointer.x - state.player.x;
       const dy = state.pointer.y - state.player.y;
@@ -343,8 +379,8 @@
 
   function updatePlayer(dt) {
     const ax = axisFromKeys();
-
     const spd = CFG.gameplay.playerSpeed;
+
     state.player.vx = ax.x * spd;
     state.player.vy = ax.y * spd;
 
@@ -359,6 +395,7 @@
   // -------- Game loop
   function reset() {
     resizeCanvas();
+
     state.t = 0;
     state.last = performance.now();
     state.paused = false;
@@ -374,19 +411,26 @@
     state.combo = 0;
 
     state.moment.active = false;
-    state.moment.collected = false;
 
     state.player.x = state.view.w * 0.5;
     state.player.y = state.view.h * 0.5;
     state.player.vx = 0;
     state.player.vy = 0;
 
+    if (els.tLabel) els.tLabel.textContent = state.spawnEvery.toFixed(1);
     if (els.hint && CFG.ui.showHintDuringPlay) els.hint.style.display = "";
+  }
+
+  function startWithMode(key) {
+    state.modeKey = key;
+    state.mode = MODES[key] || MODES.signal;
+    reset();
+    showOverlay(false);
   }
 
   function die() {
     state.dead = true;
-    showOverlay(true, `You touched your past.\nScore: ${state.score}  •  Combo: ${state.combo}`);
+    showOverlay(true);
     if (els.hint) els.hint.style.display = "none";
   }
 
@@ -395,18 +439,15 @@
 
     state.t += dt;
 
-    // Window expiry BEFORE spawn (so missing breaks combo cleanly)
+    // expire moment window first (B rule)
     expireMomentIfNeeded();
 
-    // Spawn afterimage + new moment at cadence
+    // Spawn cadence
     if (state.t >= state.nextSpawnAt) {
-      // If moment is still active here, it just expired => combo already broken above
       spawnAfterimage();
 
-      // next window
       state.nextSpawnAt = state.t + state.spawnEvery;
 
-      // optional ramp: tighten cadence over time (keeps runs finite)
       if (CFG.gameplay.rampEnabled) {
         state.spawnEvery = Math.max(
           CFG.gameplay.spawnEveryMinSec,
@@ -415,20 +456,14 @@
       }
       if (els.tLabel) els.tLabel.textContent = state.spawnEvery.toFixed(1);
 
-      // spawn a fresh moment for THIS new window
       spawnMoment();
     }
 
     updateAfterimages();
     updatePlayer(dt);
-
-    // record movement for upcoming afterimage
     recordSample();
-
-    // moment collection check
     tryCollectMoment();
 
-    // collision
     if (collidePlayerWithAfterimages()) die();
   }
 
@@ -464,7 +499,6 @@
       ctx.beginPath();
       ctx.arc(g.x, g.y, state.player.r + 3, 0, Math.PI * 2);
       ctx.stroke();
-
       ctx.restore();
     }
   }
@@ -476,7 +510,6 @@
     const pulse = 0.5 + 0.5 * Math.sin(state.t * 6.0);
     const a = 0.55 + 0.25 * pulse;
 
-    // subtle “glyph” diamond (quiet, readable)
     ctx.save();
     ctx.translate(state.moment.x, state.moment.y);
 
@@ -492,7 +525,6 @@
     ctx.closePath();
     ctx.stroke();
 
-    // tiny core
     ctx.globalAlpha = a * 0.8;
     ctx.fillStyle = "rgba(233,237,243,1)";
     ctx.beginPath();
@@ -512,14 +544,12 @@
     ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
     ctx.fill();
 
-    // subtle halo
     ctx.globalAlpha = 0.08;
     ctx.strokeStyle = "rgba(233,237,243,1)";
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.r + 8, 0, Math.PI * 2);
     ctx.stroke();
-
     ctx.restore();
   }
 
@@ -530,12 +560,13 @@
     drawMoment();
     drawPlayer();
 
-    // HUD text (keep it compact)
+    // HUD
     const timeStr = state.t.toFixed(2);
     const comboStr = state.combo > 0 ? `x${state.combo}` : "—";
-    if (els.time) els.time.textContent = `${timeStr}  •  ${state.score}  •  ${comboStr}`;
+    const modeStr = state.mode.name;
+    const speedStr = state.mode.phaseCompression ? `${replaySpeedMult().toFixed(2)}x` : "1.00x";
+    if (els.time) els.time.textContent = `${modeStr} (${speedStr}) • ${timeStr} • ${state.score} • ${comboStr}`;
 
-    // paused veil
     if (state.paused && !state.dead) {
       ctx.save();
       ctx.fillStyle = "rgba(0,0,0,.35)";
@@ -555,10 +586,12 @@
     const k = e.code;
 
     if (k === "KeyR") {
-      reset();
-      showOverlay(false);
+      startWithMode(state.modeKey); // restart same mode
       return;
     }
+
+    if (k === "Digit1") startWithMode("signal");
+    if (k === "Digit2") startWithMode("pressure");
 
     if (k === "Space") {
       state.paused = !state.paused;
@@ -605,7 +638,9 @@
 
   // -------- Boot
   resizeCanvas();
+  ensureModeButtons();
   showOverlay(true);
   setHow(true);
+
   requestAnimationFrame(tick);
 })();
