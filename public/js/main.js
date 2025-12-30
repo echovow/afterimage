@@ -1,10 +1,11 @@
 (() => {
-  const CFG = window.CONFIG;
+  // ========= Afterimage Arcade v3 (Flow Field + Obstacles + Pulse)
+  // Drop-in main.js. No dependencies.
 
-  // -------- DOM
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d", { alpha: true });
 
+  // Optional DOM (safe if missing)
   const els = {
     overlay: document.getElementById("overlay"),
     btnStart: document.getElementById("btnStart"),
@@ -13,671 +14,565 @@
     time: document.getElementById("time"),
     hint: document.getElementById("hint"),
     tLabel: document.getElementById("tLabel"),
+    pump: document.getElementById("btnPump"), // optional button
   };
 
-  els.tLabel.textContent = CFG.gameplay.spawnEverySec.toFixed(1);
+  // ---- config (tweak here)
+  const CFG = {
+    // Feel
+    playerRadius: 10,
+    baseAccel: 0.55,
+    maxSpeed: 6.5,
+    friction: 0.975,
 
-  // -------- Helpers
-  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-  function rand(a, b) { return a + Math.random() * (b - a); }
-  function randi(a, b) { return Math.floor(rand(a, b + 1)); }
+    // Flow field
+    flowStrength: 0.22,      // baseline drift
+    flowStrengthRamp: 0.008, // added per 10s
+    flowScale: 0.0032,       // spatial frequency
+    flowSpeed: 0.22,         // time evolution
+    flowVisualDensity: 42,   // lower = more field lines
 
-  // -------- State
+    // Obstacles
+    obstacleBaseCount: 3,
+    obstacleRampEvery: 10,    // seconds to add another obstacle
+    obstacleRadius: 10,
+    obstacleSpeed: 1.65,
+    obstacleSpeedRamp: 0.06,  // per 10s
+
+    // Pulse (SPACE)
+    pulseDuration: 0.85, // seconds
+    pulseCooldown: 6.0,  // seconds
+    pulseBoost: 2.0,     // acceleration multiplier
+    pulseInvuln: 0.25,   // seconds at start of pulse
+
+    // Aesthetic
+    vignette: true,
+    starCount: 120,
+    trailLength: 26,
+    trailFade: 0.86,
+
+    // Links / lore
+    pumpUrl: "https://pump.fun/", // change to your coin link later
+    title: "AFTERIMAGE",
+    lore: [
+      "You are not the dot.",
+      "You are the wake it leaves behind.",
+      "Survive the drift. Outlast the pressure.",
+    ],
+  };
+
+  // ========= utilities
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const len = (x, y) => Math.hypot(x, y);
+
+  // deterministic-ish hash noise (fast)
+  function hash2(x, y) {
+    let n = x * 374761393 + y * 668265263;
+    n = (n ^ (n >> 13)) * 1274126177;
+    return ((n ^ (n >> 16)) >>> 0) / 4294967295;
+  }
+  function smoothstep(t) { return t * t * (3 - 2 * t); }
+  function valueNoise(x, y) {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = x - xi, yf = y - yi;
+    const u = smoothstep(xf), v = smoothstep(yf);
+
+    const a = hash2(xi, yi);
+    const b = hash2(xi + 1, yi);
+    const c = hash2(xi, yi + 1);
+    const d = hash2(xi + 1, yi + 1);
+
+    const ab = lerp(a, b, u);
+    const cd = lerp(c, d, u);
+    return lerp(ab, cd, v);
+  }
+  function flowVector(px, py, t) {
+    // angle from noise → vector
+    const s = CFG.flowScale;
+    const n = valueNoise(px * s + t * CFG.flowSpeed, py * s + t * CFG.flowSpeed);
+    const a = n * Math.PI * 2;
+    return { x: Math.cos(a), y: Math.sin(a) };
+  }
+
+  // ========= sizing
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = Math.floor(window.innerWidth);
+    H = Math.floor(window.innerHeight);
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ========= world
+  const stars = Array.from({ length: CFG.starCount }, () => ({
+    x: Math.random(),
+    y: Math.random(),
+    r: 0.6 + Math.random() * 1.6,
+    tw: Math.random() * 10,
+  }));
+
   const state = {
     running: false,
+    over: false,
     paused: false,
-    dead: false,
-
-    view: { w: CFG.canvas.baseWidth, h: CFG.canvas.baseHeight },
-
+    t0: 0,
     t: 0,
-    lastFrame: 0,
+    dt: 0,
+    last: 0,
 
-    spawnEvery: CFG.gameplay.spawnEverySec,
-    nextSpawnAt: CFG.gameplay.spawnEverySec,
+    // input
+    keys: new Set(),
+    pointerDown: false,
+    pointerX: 0,
+    pointerY: 0,
 
-    player: {
-      x: 0, y: 0,
-      vx: 0, vy: 0,
-      r: CFG.gameplay.playerRadius,
-    },
+    // pulse
+    pulseActive: false,
+    pulseT: 0,
+    pulseCooldownT: 0,
 
-    // Recorder: ring buffer of samples over recordWindowSec
-    recorder: {
-      maxSec: CFG.gameplay.recordWindowSec,
-      samples: [], // {t, x, y}
-    },
+    // player
+    p: { x: W * 0.5, y: H * 0.5, vx: 0, vy: 0 },
+    trail: [],
 
-    // Afterimages: each has its own recorded samples, loops over them
-    afterimages: [], // { bornAt, samples, duration, idx, x, y }
-
-    // Distortions
-    distortions: {
-      lanes: [],
-    },
-
-    // Track dt last for ramp boundary checks
-    dtLast: 0,
+    // obstacles
+    obs: [],
   };
 
-  // -------- Canvas sizing (crisp but capped DPR)
-  function resizeCanvas() {
-    // CSS size comes from layout; canvas internal resolution set here.
-    const rect = canvas.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, CFG.canvas.pixelRatioCap);
+  function resetRun() {
+    state.running = true;
+    state.over = false;
+    state.paused = false;
 
-    canvas.width = Math.floor(rect.width * dpr);
-    canvas.height = Math.floor(rect.height * dpr);
+    state.t0 = performance.now();
+    state.last = performance.now();
+    state.t = 0;
 
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
-    state.view.w = rect.width;
-    state.view.h = rect.height;
+    state.p = { x: W * 0.5, y: H * 0.5, vx: 0, vy: 0 };
+    state.trail = [];
+    state.obs = [];
+    spawnObstacles(CFG.obstacleBaseCount);
 
-    // Re-seed lanes to fit new viewport (only if game is running)
-    if (state.running) {
-      state.distortions.lanes = initDistortions(state.view.w, state.view.h);
+    state.pulseActive = false;
+    state.pulseT = 0;
+    state.pulseCooldownT = 0;
+  }
+
+  function spawnObstacles(n) {
+    for (let i = 0; i < n; i++) {
+      const edge = Math.floor(Math.random() * 4);
+      const pad = 40;
+      let x = 0, y = 0;
+      if (edge === 0) { x = -pad; y = Math.random() * H; }
+      if (edge === 1) { x = W + pad; y = Math.random() * H; }
+      if (edge === 2) { x = Math.random() * W; y = -pad; }
+      if (edge === 3) { x = Math.random() * W; y = H + pad; }
+
+      // aim vaguely toward center
+      const dx = (W * 0.5 - x) + (Math.random() - 0.5) * 200;
+      const dy = (H * 0.5 - y) + (Math.random() - 0.5) * 200;
+      const d = Math.max(1, Math.hypot(dx, dy));
+      const sp = CFG.obstacleSpeed;
+      state.obs.push({
+        x, y,
+        vx: (dx / d) * sp,
+        vy: (dy / d) * sp,
+        r: CFG.obstacleRadius + Math.random() * 6,
+        phase: Math.random() * 10,
+      });
     }
   }
 
-  // -------- Input
-  const keys = new Set();
-  window.addEventListener("keydown", (e) => {
-    const k = e.key.toLowerCase();
-    keys.add(k);
+  // ========= overlay helpers
+  function showOverlay(on) {
+    if (!els.overlay) return;
+    els.overlay.style.display = on ? "flex" : "none";
+  }
 
-    if (k === " " || k === "spacebar") {
-      e.preventDefault();
-      togglePause();
+  function setOverlayText() {
+    if (!els.overlay) return;
+    // If your HTML already has lore text, ignore. Otherwise, we can set hint.
+    if (els.hint) {
+      els.hint.innerHTML =
+        `<div style="opacity:.9">${CFG.title}</div>` +
+        `<div style="opacity:.7;margin-top:8px;line-height:1.4">${CFG.lore.join("<br>")}</div>` +
+        `<div style="opacity:.55;margin-top:12px">WASD / Arrows • Mouse/Touch pull • SPACE Pulse • R Restart</div>`;
     }
-    if (k === "r") restart();
-    if (k === "escape") showOverlay(true);
+    if (els.pump) {
+      els.pump.onclick = () => window.open(CFG.pumpUrl, "_blank");
+    }
+  }
+  setOverlayText();
+
+  // ========= input
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space") e.preventDefault();
+
+    if (e.code === "KeyR") {
+      resetRun();
+      showOverlay(false);
+      return;
+    }
+    if (e.code === "KeyP") {
+      state.paused = !state.paused;
+      return;
+    }
+    if (!state.running && !state.over && (e.code === "Enter" || e.code === "Space")) {
+      resetRun();
+      showOverlay(false);
+      return;
+    }
+
+    state.keys.add(e.code);
+
+    if (e.code === "Space") tryPulse();
   });
 
   window.addEventListener("keyup", (e) => {
-    keys.delete(e.key.toLowerCase());
+    state.keys.delete(e.code);
   });
 
-  function axis() {
-    let x = 0, y = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    state.pointerDown = true;
+    const rect = canvas.getBoundingClientRect();
+    state.pointerX = e.clientX - rect.left;
+    state.pointerY = e.clientY - rect.top;
 
-    const left  = keys.has("a") || keys.has("arrowleft");
-    const right = keys.has("d") || keys.has("arrowright");
-    const up    = keys.has("w") || keys.has("arrowup");
-    const down  = keys.has("s") || keys.has("arrowdown");
-
-    if (left) x -= 1;
-    if (right) x += 1;
-    if (up) y -= 1;
-    if (down) y += 1;
-
-    // normalize diagonal
-    if (x !== 0 && y !== 0) {
-      const inv = 1 / Math.sqrt(2);
-      x *= inv; y *= inv;
+    if (els.overlay && els.overlay.style.display !== "none") {
+      resetRun();
+      showOverlay(false);
     }
-    return { x, y };
-  }
-
-  // ---------------------------
-  // Field Distortion Lanes v1.0
-  // ---------------------------
-  const DISTORT = {
-    enabled: true,
-
-    // how many lanes exist at once
-    minLanes: 2,
-    maxLanes: 4,
-
-    // lane width in pixels (feel > visuals)
-    widthMin: 90,
-    widthMax: 180,
-
-    // drift speed (px/sec)
-    speedMin: 18,
-    speedMax: 45,
-
-    // how strongly it affects movement
-    // (0.0 = no effect, 1.0 = brutal)
-    dragStrength: 0.55,     // "thick air"
-    pullStrength: 120,      // px/sec^2 lateral pull
-
-    // lane alpha + soft edges
-    alpha: 0.10,
-    feather: 42,            // edge softness in px
-
-    // behavior mix
-    modeMix: 0.60,          // 60% drag lanes, 40% pull lanes
-
-    // respawn when fully offscreen
-    pad: 140,
-  };
-
-  // Feathered band intensity 0..1 at point
-  function bandIntensity(px, py, lane) {
-    const dx = px - lane.cx;
-    const dy = py - lane.cy;
-
-    // signed distance to lane centerline along normal
-    const dist = dx * lane.nx + dy * lane.ny;
-    const ad = Math.abs(dist);
-
-    const halfW = lane.halfW;
-    const feather = DISTORT.feather;
-
-    if (ad >= halfW + feather) return 0;
-    if (ad <= halfW) return 1;
-
-    // linear feather falloff
-    const t = (ad - halfW) / feather; // 0..1
-    return 1 - t;
-  }
-
-  class DistortionLane {
-    constructor(w, h) {
-      this.reset(w, h, true);
-    }
-
-    reset(w, h, initial = false) {
-      // lane orientation
-      const ang = rand(0, Math.PI); // 0..180deg
-      const tx = Math.cos(ang), ty = Math.sin(ang);
-
-      // normal to the lane direction
-      this.nx = -ty;
-      this.ny = tx;
-
-      this.halfW = rand(DISTORT.widthMin, DISTORT.widthMax) * 0.5;
-
-      // drift: mostly along normal so lanes sweep across screen
-      const driftDir = (Math.random() < 0.5) ? -1 : 1;
-      const spd = rand(DISTORT.speedMin, DISTORT.speedMax) * driftDir;
-
-      this.vx = this.nx * spd;
-      this.vy = this.ny * spd;
-
-      // choose a random point near screen, then offset backward along velocity
-      const pad = DISTORT.pad;
-      const spawnX = rand(-pad, w + pad);
-      const spawnY = rand(-pad, h + pad);
-
-      const magV = Math.hypot(this.vx, this.vy) || 1;
-      const back = (w + h + pad * 2) * (initial ? 0.35 : 0.65);
-
-      this.cx = spawnX - (this.vx / magV) * back;
-      this.cy = spawnY - (this.vy / magV) * back;
-
-      // lane type
-      this.mode = (Math.random() < DISTORT.modeMix) ? "drag" : "pull";
-      this.pullSign = (Math.random() < 0.5) ? -1 : 1;
-    }
-
-    update(dt, w, h) {
-      this.cx += this.vx * dt;
-      this.cy += this.vy * dt;
-
-      const pad = DISTORT.pad;
-      const off =
-        this.cx < -pad * 2 ||
-        this.cx > w + pad * 2 ||
-        this.cy < -pad * 2 ||
-        this.cy > h + pad * 2;
-
-      if (off) this.reset(w, h, false);
-    }
-
-    draw(ctx) {
-      // Render lane as a wide band: long rect rotated along tangent.
-      // tangent is perpendicular to normal: t = (ny, -nx)
-      const tx = this.ny;
-      const ty = -this.nx;
-
-      const L = 5000;
-      const W = this.halfW * 2 + DISTORT.feather * 2;
-
-      ctx.save();
-      ctx.translate(this.cx, this.cy);
-
-      const ang = Math.atan2(ty, tx);
-      ctx.rotate(ang);
-
-      // soft gradient across width
-      const g = ctx.createLinearGradient(0, -W / 2, 0, W / 2);
-      const a = DISTORT.alpha;
-
-      // Slightly different density for pull lanes (subtle readability)
-      const aMid = this.mode === "pull" ? a * 1.25 : a * 1.05;
-
-      g.addColorStop(0.00, `rgba(255,255,255,0)`);
-      g.addColorStop(0.25, `rgba(255,255,255,${a})`);
-      g.addColorStop(0.50, `rgba(255,255,255,${aMid})`);
-      g.addColorStop(0.75, `rgba(255,255,255,${a})`);
-      g.addColorStop(1.00, `rgba(255,255,255,0)`);
-
-      ctx.fillStyle = g;
-      ctx.fillRect(-L / 2, -W / 2, L, W);
-
-      ctx.restore();
-    }
-  }
-
-  function initDistortions(w, h) {
-    const lanes = [];
-    const n = randi(DISTORT.minLanes, DISTORT.maxLanes);
-    for (let i = 0; i < n; i++) lanes.push(new DistortionLane(w, h));
-    return lanes;
-  }
-
-  function applyDistortionsToPlayer(player, lanes, dt) {
-    if (!DISTORT.enabled || !lanes || lanes.length === 0) return;
-
-    let dragAccum = 0;
-    let pullX = 0, pullY = 0;
-
-    for (const lane of lanes) {
-      const k = bandIntensity(player.x, player.y, lane);
-      if (k <= 0) continue;
-
-      if (lane.mode === "drag") {
-        dragAccum = Math.max(dragAccum, k);
-      } else {
-        const s = lane.pullSign;
-        pullX += lane.nx * (DISTORT.pullStrength * k) * s;
-        pullY += lane.ny * (DISTORT.pullStrength * k) * s;
-      }
-    }
-
-    // Drag scales velocity down smoothly; clamp prevents full freeze.
-    if (dragAccum > 0) {
-      const d = 1 - (DISTORT.dragStrength * dragAccum);
-      const clampMin = 0.30;
-      const factor = Math.max(clampMin, d);
-      player.vx *= factor;
-      player.vy *= factor;
-    }
-
-    // Pull adds acceleration-like influence.
-    if (pullX || pullY) {
-      player.vx += pullX * dt;
-      player.vy += pullY * dt;
-    }
-  }
-
-  function stepDistortions(dt) {
-    const lanes = state.distortions.lanes;
-    const w = state.view.w, h = state.view.h;
-    for (const lane of lanes) lane.update(dt, w, h);
-  }
-
-  function drawDistortions() {
-    const lanes = state.distortions.lanes;
-    for (const lane of lanes) lane.draw(ctx);
-  }
-
-  // -------- Game helpers
-  function wallBounds() {
-    const pad = CFG.gameplay.wallPadding;
-    return {
-      minX: pad,
-      minY: pad,
-      maxX: state.view.w - pad,
-      maxY: state.view.h - pad,
-    };
-  }
-
-  function recordSample() {
-    const t = state.t;
-    const s = state.recorder.samples;
-    s.push({ t, x: state.player.x, y: state.player.y });
-
-    // Trim older than recordWindowSec
-    const cutoff = t - state.recorder.maxSec;
-    while (s.length && s[0].t < cutoff) s.shift();
-  }
-
-  function spawnAfterimage() {
-    const s = state.recorder.samples;
-    if (s.length < 2) return;
-
-    const startT = s[0].t;
-    const duration = s[s.length - 1].t - startT;
-    if (duration <= 0.05) return;
-
-    const samples = s.map(p => ({ t: p.t - startT, x: p.x, y: p.y }));
-
-    state.afterimages.push({
-      bornAt: state.t,
-      samples,
-      duration,
-      idx: 0,
-      x: samples[0].x,
-      y: samples[0].y,
-    });
-
-    const cap = CFG.gameplay.maxAfterimages;
-    if (state.afterimages.length > cap) {
-      state.afterimages.shift();
-    }
-  }
-
-  function stepAfterimages(dt) {
-    for (const g of state.afterimages) {
-      const local = (state.t - g.bornAt) % g.duration;
-
-      while (g.idx < g.samples.length - 2 && g.samples[g.idx + 1].t < local) {
-        g.idx++;
-      }
-
-      const a = g.samples[g.idx];
-      const b = g.samples[Math.min(g.idx + 1, g.samples.length - 1)];
-
-      const span = Math.max(0.0001, b.t - a.t);
-      const u = clamp((local - a.t) / span, 0, 1);
-      g.x = a.x + (b.x - a.x) * u;
-      g.y = a.y + (b.y - a.y) * u;
-    }
-  }
-
-  function collidePlayerWithAfterimages() {
-    const px = state.player.x, py = state.player.y, pr = state.player.r;
-    const rr = pr + pr;
-    const rr2 = rr * rr;
-
-    for (const g of state.afterimages) {
-      const dx = g.x - px;
-      const dy = g.y - py;
-      if (dx * dx + dy * dy <= rr2) return true;
-    }
-    return false;
-  }
-
-  function rampDifficulty() {
-    if (!CFG.gameplay.ramp.enabled) return;
-
-    const every = CFG.gameplay.ramp.everySec;
-    if (every <= 0) return;
-
-    const stepIdx = Math.floor(state.t / every);
-    const baseIdx = Math.floor((state.t - state.dtLast) / every);
-
-    if (stepIdx > baseIdx) {
-      state.spawnEvery = Math.max(
-        CFG.gameplay.ramp.minSpawnEverySec,
-        state.spawnEvery + CFG.gameplay.ramp.spawnEveryDelta
-      );
-      state.nextSpawnAt = state.t + state.spawnEvery;
-    }
-  }
-
-  // -------- Overlay controls
-  function showOverlay(show, deathText) {
-    els.overlay.style.display = show ? "flex" : "none";
-    if (deathText) {
-      els.overlay.querySelector(".subtitle").textContent = deathText;
-      els.btnStart.textContent = "RETRY";
-    } else {
-      els.overlay.querySelector(".subtitle").textContent = "Your last seconds return. Survive yourself.";
-      els.btnStart.textContent = "PLAY";
-    }
-  }
-
-  els.btnStart.addEventListener("click", () => {
-    showOverlay(false);
-    start();
   });
 
-  els.btnHow.addEventListener("click", () => {
-    els.how.classList.toggle("hidden");
+  window.addEventListener("pointermove", (e) => {
+    if (!state.pointerDown) return;
+    const rect = canvas.getBoundingClientRect();
+    state.pointerX = e.clientX - rect.left;
+    state.pointerY = e.clientY - rect.top;
   });
 
-  // -------- Game flow
-  function resetState() {
-    state.t = 0;
-    state.lastFrame = 0;
-    state.dead = false;
-    state.paused = false;
+  window.addEventListener("pointerup", () => {
+    state.pointerDown = false;
+  });
 
-    state.spawnEvery = CFG.gameplay.spawnEverySec;
-    state.nextSpawnAt = state.spawnEvery;
-
-    state.recorder.samples = [];
-    state.afterimages = [];
-
-    // center player
-    state.player.x = state.view.w * 0.5;
-    state.player.y = state.view.h * 0.5;
-    state.player.vx = 0;
-    state.player.vy = 0;
-
-    // Seed field distortions
-    state.distortions.lanes = initDistortions(state.view.w, state.view.h);
-
-    if (CFG.ui.showHintDuringPlay) {
-      els.hint.style.display = "";
-      els.hint.textContent = "WASD/ARROWS move · R restart · SPACE pause";
-    }
+  function tryPulse() {
+    if (!state.running || state.over) return;
+    if (state.pulseCooldownT > 0) return;
+    state.pulseActive = true;
+    state.pulseT = CFG.pulseDuration;
+    state.pulseCooldownT = CFG.pulseCooldown;
   }
 
-  function start() {
-    if (!state.running) {
-      state.running = true;
-      resetState();
-      resizeCanvas();
-      // Re-seed again after resize to ensure correct viewport size
-      state.distortions.lanes = initDistortions(state.view.w, state.view.h);
-      requestAnimationFrame(loop);
-    } else {
-      restart();
-    }
-  }
-
-  function restart() {
-    if (!state.running) return;
-    resetState();
-    showOverlay(false);
-  }
-
-  function togglePause() {
-    if (!state.running || state.dead) return;
-    state.paused = !state.paused;
-    if (state.paused) {
-      if (CFG.ui.showHintDuringPlay) els.hint.textContent = "PAUSED · press SPACE to resume · R restart";
-    } else {
-      if (CFG.ui.showHintDuringPlay) els.hint.textContent =
-        "WASD/ARROWS move · R restart · SPACE pause";
-    }
-  }
-
-  // -------- Update
+  // ========= gameplay update
   function update(dt) {
-    state.dtLast = dt;
-    if (state.paused || state.dead) return;
+    if (!state.running || state.over || state.paused) return;
 
     state.t += dt;
 
-    // Update distortion lanes
-    stepDistortions(dt);
+    // difficulty ramp
+    const tens = state.t / 10;
+    const flowPow = CFG.flowStrength + tens * CFG.flowStrengthRamp;
+    const obsSpeed = CFG.obstacleSpeed + tens * CFG.obstacleSpeedRamp;
 
-    // Movement (arcade-tight)
-    const ax = axis();
-    const spd = CFG.gameplay.playerSpeed;
+    // add obstacles over time
+    const targetCount = CFG.obstacleBaseCount + Math.floor(state.t / CFG.obstacleRampEvery);
+    if (state.obs.length < targetCount) spawnObstacles(1);
 
-    state.player.vx = ax.x * spd;
-    state.player.vy = ax.y * spd;
+    // player input accel
+    let ax = 0, ay = 0;
+    const k = state.keys;
 
-    // Apply distortions AFTER input sets velocity but BEFORE movement
-    applyDistortionsToPlayer(state.player, state.distortions.lanes, dt);
+    if (k.has("ArrowLeft") || k.has("KeyA")) ax -= 1;
+    if (k.has("ArrowRight") || k.has("KeyD")) ax += 1;
+    if (k.has("ArrowUp") || k.has("KeyW")) ay -= 1;
+    if (k.has("ArrowDown") || k.has("KeyS")) ay += 1;
 
-    state.player.x += state.player.vx * dt;
-    state.player.y += state.player.vy * dt;
+    // normalize keyboard vector
+    const aLen = Math.hypot(ax, ay);
+    if (aLen > 0) { ax /= aLen; ay /= aLen; }
 
-    // Walls
-    const b = wallBounds();
-    state.player.x = clamp(state.player.x, b.minX, b.maxX);
-    state.player.y = clamp(state.player.y, b.minY, b.maxY);
-
-    // Record current sample (for upcoming afterimage)
-    recordSample();
-
-    // Spawn afterimage when time hits
-    if (state.t >= state.nextSpawnAt) {
-      spawnAfterimage();
-      state.nextSpawnAt = state.t + state.spawnEvery;
+    // pointer pull (gentle)
+    if (state.pointerDown) {
+      const dx = state.pointerX - state.p.x;
+      const dy = state.pointerY - state.p.y;
+      const d = Math.max(1, Math.hypot(dx, dy));
+      // gentle pull that doesn't override skill; clamps close range
+      const pull = clamp(d / 180, 0, 1);
+      ax += (dx / d) * pull * 0.85;
+      ay += (dy / d) * pull * 0.85;
     }
 
-    // Step afterimages
-    stepAfterimages(dt);
+    // flow field force
+    const fv = flowVector(state.p.x, state.p.y, state.t);
+    ax += fv.x * flowPow;
+    ay += fv.y * flowPow;
 
-    // Difficulty ramp
-    rampDifficulty();
-
-    // Collision
-    if (collidePlayerWithAfterimages()) {
-      state.dead = true;
-      if (CFG.ui.showHintDuringPlay) els.hint.style.display = "none";
-      showOverlay(true, `You touched your past. Time: ${state.t.toFixed(2)}s`);
+    // pulse modifies acceleration + adds brief invulnerability
+    let accelMul = 1;
+    if (state.pulseActive) {
+      accelMul = CFG.pulseBoost;
+      state.pulseT -= dt;
+      if (state.pulseT <= 0) state.pulseActive = false;
     }
-  }
+    if (state.pulseCooldownT > 0) state.pulseCooldownT = Math.max(0, state.pulseCooldownT - dt);
 
-  // -------- Render
-  function clear() {
-    ctx.clearRect(0, 0, state.view.w, state.view.h);
-  }
+    // apply physics
+    state.p.vx += ax * CFG.baseAccel * accelMul;
+    state.p.vy += ay * CFG.baseAccel * accelMul;
 
-  function drawArena() {
-    const b = wallBounds();
-    ctx.save();
-    ctx.globalAlpha = 0.8;
-    ctx.strokeStyle = "rgba(233,237,243,.12)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(b.minX - 14, b.minY - 14, (b.maxX - b.minX) + 28, (b.maxY - b.minY) + 28, 18);
-    ctx.stroke();
-    ctx.restore();
-  }
+    // clamp speed
+    const sp = Math.hypot(state.p.vx, state.p.vy);
+    const ms = CFG.maxSpeed * (state.pulseActive ? 1.15 : 1);
+    if (sp > ms) {
+      state.p.vx = (state.p.vx / sp) * ms;
+      state.p.vy = (state.p.vy / sp) * ms;
+    }
 
-  function drawAfterimages() {
-    const n = state.afterimages.length;
-    if (!n) return;
+    state.p.vx *= CFG.friction;
+    state.p.vy *= CFG.friction;
 
-    const aCfg = CFG.gameplay.afterimage;
-    for (let i = 0; i < n; i++) {
-      const g = state.afterimages[i];
+    state.p.x += state.p.vx;
+    state.p.y += state.p.vy;
 
-      const age01 = n <= 1 ? 1 : i / (n - 1);
-      const alpha = aCfg.oldestAlpha + (aCfg.newestAlpha - aCfg.oldestAlpha) * age01;
+    // bounds with soft bounce
+    const r = CFG.playerRadius;
+    if (state.p.x < r) { state.p.x = r; state.p.vx *= -0.65; }
+    if (state.p.x > W - r) { state.p.x = W - r; state.p.vx *= -0.65; }
+    if (state.p.y < r) { state.p.y = r; state.p.vy *= -0.65; }
+    if (state.p.y > H - r) { state.p.y = H - r; state.p.vy *= -0.65; }
 
-      ctx.save();
-      ctx.globalAlpha = alpha;
+    // trail
+    state.trail.unshift({ x: state.p.x, y: state.p.y, a: 1 });
+    if (state.trail.length > CFG.trailLength) state.trail.pop();
+    for (const t of state.trail) t.a *= CFG.trailFade;
 
-      ctx.fillStyle = "rgba(233,237,243,1)";
-      if (aCfg.glow) {
-        ctx.shadowBlur = 16;
-        ctx.shadowColor = "rgba(233,237,243,.30)";
+    // obstacles update + collision
+    for (const o of state.obs) {
+      // flow field influences obstacles too (keeps it “alive”)
+      const of = flowVector(o.x, o.y, state.t + o.phase);
+      o.vx = lerp(o.vx, of.x * obsSpeed, 0.015);
+      o.vy = lerp(o.vy, of.y * obsSpeed, 0.015);
+
+      o.x += o.vx;
+      o.y += o.vy;
+
+      // wrap around edges (keeps pressure consistent)
+      const pad = 60;
+      if (o.x < -pad) o.x = W + pad;
+      if (o.x > W + pad) o.x = -pad;
+      if (o.y < -pad) o.y = H + pad;
+      if (o.y > H + pad) o.y = -pad;
+
+      // collision unless invuln window
+      const invuln = state.pulseActive && (state.pulseT > (CFG.pulseDuration - CFG.pulseInvuln));
+      const d = Math.hypot(o.x - state.p.x, o.y - state.p.y);
+      if (!invuln && d < (o.r + CFG.playerRadius)) {
+        gameOver();
+        return;
       }
+    }
+
+    // UI time
+    if (els.time) els.time.textContent = state.t.toFixed(2);
+  }
+
+  function gameOver() {
+    state.over = true;
+    state.running = false;
+    showOverlay(true);
+    if (els.hint) {
+      els.hint.innerHTML =
+        `<div style="opacity:.9">RUN ENDED</div>` +
+        `<div style="opacity:.7;margin-top:8px">Time: <b>${state.t.toFixed(2)}s</b></div>` +
+        `<div style="opacity:.55;margin-top:12px">Press R to restart</div>` +
+        `<div style="opacity:.55;margin-top:10px;line-height:1.4">${CFG.lore.join("<br>")}</div>`;
+    }
+  }
+
+  // ========= render
+  function draw() {
+    // clear
+    ctx.clearRect(0, 0, W, H);
+
+    // background stars
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    for (const s of stars) {
+      const tw = 0.55 + 0.45 * Math.sin(state.t * 0.6 + s.tw);
+      const x = s.x * W;
+      const y = s.y * H;
+      ctx.globalAlpha = 0.18 * tw;
       ctx.beginPath();
-      ctx.arc(g.x, g.y, state.player.r, 0, Math.PI * 2);
+      ctx.arc(x, y, s.r, 0, Math.PI * 2);
+      ctx.fillStyle = "#fff";
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // flow field visualization (directional threads)
+    drawFlowField();
+
+    // obstacles
+    for (const o of state.obs) {
+      ctx.save();
+      ctx.globalAlpha = 0.65;
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.22)";
       ctx.fill();
 
-      ctx.globalAlpha = Math.min(1, alpha + aCfg.strokeAlpha);
-      ctx.shadowBlur = 0;
-      ctx.strokeStyle = "rgba(233,237,243,.35)";
+      ctx.globalAlpha = 0.35;
       ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, state.player.r + 3, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255,255,255,0.22)";
       ctx.stroke();
-
       ctx.restore();
     }
-  }
 
-  function drawPlayer() {
-    const p = state.player;
-
+    // trail / afterimages
     ctx.save();
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = "rgba(233,237,243,1)";
-    ctx.shadowBlur = 18;
-    ctx.shadowColor = "rgba(233,237,243,.35)";
+    for (let i = state.trail.length - 1; i >= 0; i--) {
+      const t = state.trail[i];
+      const rr = CFG.playerRadius * (0.9 + i * 0.012);
+      ctx.globalAlpha = 0.14 * t.a;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, rr, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // player core
+    ctx.save();
+    const glow = state.pulseActive ? 0.95 : 0.75;
+    ctx.globalAlpha = glow;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.arc(state.p.x, state.p.y, CFG.playerRadius, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
     ctx.fill();
 
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = "rgba(233,237,243,.25)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r + 4, 0, Math.PI * 2);
-    ctx.stroke();
+    // pulse ring
+    if (state.pulseActive) {
+      const t = state.pulseT / CFG.pulseDuration;
+      ctx.globalAlpha = 0.35 * (1 - t);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(state.p.x, state.p.y, CFG.playerRadius + 26 * (1 - t), 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.stroke();
+    }
+
+    ctx.restore();
+
+    // UI (minimal)
+    drawHud();
+
+    // vignette
+    if (CFG.vignette) drawVignette();
+  }
+
+  function drawFlowField() {
+    const step = CFG.flowVisualDensity; // lower=denser
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+
+    for (let y = 0; y < H; y += step) {
+      for (let x = 0; x < W; x += step) {
+        const v = flowVector(x, y, state.t);
+        const L = 16; // line length
+        const x2 = x + v.x * L;
+        const y2 = y + v.y * L;
+
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x2, y2);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(255,255,255,0.14)";
+        ctx.stroke();
+      }
+    }
 
     ctx.restore();
   }
 
-  function draw() {
-    clear();
-    drawArena();
+  function drawHud() {
+    const pad = 14;
 
-    // Distortions live as "field layer"
-    drawDistortions();
+    // time
+    ctx.save();
+    ctx.globalAlpha = 0.7;
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText(`TIME`, pad, pad + 2);
+    ctx.globalAlpha = 0.92;
+    ctx.font = "22px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.fillText(`${state.t.toFixed(2)}`, pad, pad + 28);
 
-    drawAfterimages();
-    drawPlayer();
+    // pulse meter
+    const w = 140, h = 8;
+    const x = pad, y = pad + 42;
+    const cd = CFG.pulseCooldown;
+    const f = cd === 0 ? 1 : 1 - (state.pulseCooldownT / cd);
+    ctx.globalAlpha = 0.22;
+    ctx.fillStyle = "rgba(255,255,255,0.8)";
+    ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = 0.62;
+    ctx.fillRect(x, y, w * clamp(f, 0, 1), h);
+    ctx.globalAlpha = 0.7;
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.fillText(`PULSE`, x + w + 10, y + 8);
 
-    els.time.textContent = state.t.toFixed(2);
-
-    // paused veil
-    if (state.paused && !state.dead) {
-      ctx.save();
-      ctx.fillStyle = "rgba(0,0,0,.35)";
-      ctx.fillRect(0, 0, state.view.w, state.view.h);
-      ctx.fillStyle = "rgba(233,237,243,.85)";
-      ctx.font = "600 18px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
-      ctx.textAlign = "center";
-      ctx.fillText("PAUSED", state.view.w / 2, state.view.h / 2);
-      ctx.restore();
-    }
+    ctx.restore();
   }
 
-  // -------- Loop
-  function loop(ts) {
-    if (!state.running) return;
+  function drawVignette() {
+    const g = ctx.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.2, W * 0.5, H * 0.5, Math.max(W, H) * 0.7);
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(1, "rgba(0,0,0,0.55)");
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
 
-    if (!state.lastFrame) state.lastFrame = ts;
-    const dt = Math.min(0.033, (ts - state.lastFrame) / 1000);
-    state.lastFrame = ts;
+  // ========= loop
+  function frame(now) {
+    const dt = clamp((now - state.last) / 1000, 0, 0.033);
+    state.last = now;
+    state.dt = dt;
 
     update(dt);
     draw();
 
-    requestAnimationFrame(loop);
+    requestAnimationFrame(frame);
   }
 
-  // -------- RoundRect polyfill for older browsers
-  if (!CanvasRenderingContext2D.prototype.roundRect) {
-    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
-      const rr = Math.min(r, w / 2, h / 2);
-      this.beginPath();
-      this.moveTo(x + rr, y);
-      this.arcTo(x + w, y, x + w, y + h, rr);
-      this.arcTo(x + w, y + h, x, y + h, rr);
-      this.arcTo(x, y + h, x, y, rr);
-      this.arcTo(x, y, x + w, y, rr);
-      this.closePath();
-      return this;
+  // ========= wiring buttons if present
+  if (els.btnStart) {
+    els.btnStart.onclick = () => {
+      resetRun();
+      showOverlay(false);
+    };
+  }
+  if (els.btnHow) {
+    els.btnHow.onclick = () => {
+      if (!els.how) return;
+      const on = els.how.style.display !== "block";
+      els.how.style.display = on ? "block" : "none";
     };
   }
 
-  // -------- Boot
-  window.addEventListener("resize", resizeCanvas);
-  setTimeout(() => resizeCanvas(), 0);
-
-  // Start overlay visible by default
+  // start with overlay visible
   showOverlay(true);
-
-  // Allow clicking canvas to start too (arcade feel)
-  canvas.addEventListener("pointerdown", () => {
-    if (els.overlay.style.display !== "none") {
-      showOverlay(false);
-      start();
-    }
+  requestAnimationFrame((t) => {
+    state.last = t;
+    requestAnimationFrame(frame);
   });
 })();
