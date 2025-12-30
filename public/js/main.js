@@ -39,16 +39,19 @@
 
   // -------- Modes
   // SIGNAL = base. PRESSURE = phase compression. ENTROPY = phase compression + deterministic desync.
+  // CROWN = PRESSURE + ENTROPY + DEBT (collecting spawns delayed hazards at moment location).
   const MODES = {
     signal: {
       name: "SIGNAL",
       phaseCompression: false,
       entropy: false,
+      crown: false,
     },
     pressure: {
       name: "PRESSURE",
       phaseCompression: true,
       entropy: false,
+      crown: false,
       rampPerSec: 0.0045, // ~ +0.27x per minute
       maxMult: 1.55,
       graceSec: 8,
@@ -57,18 +60,43 @@
       name: "ENTROPY",
       phaseCompression: true,
       entropy: true,
+      crown: false,
 
-      // Pressure tuning (can be slightly hotter than pressure if desired)
       rampPerSec: 0.0052,
       maxMult: 1.70,
       graceSec: 6,
 
-      // Entropy/Desync knobs (deterministic; ramps in over time)
       entropyCfg: {
         speedVar: 0.06,     // ±6% per-ghost speed variance
         phaseVarSec: 0.45,  // ±0.45s per-ghost phase offset
         shearPx: 10,        // perpendicular shear (px) from recorded direction
         rampSec: 35,        // time to reach full entropy strength
+      },
+    },
+    crown: {
+      name: "CROWN",
+      phaseCompression: true,
+      entropy: true,
+      crown: true,
+
+      // hotter than Entropy: this is the "real players" lane
+      rampPerSec: 0.0062,
+      maxMult: 1.88,
+      graceSec: 4,
+
+      entropyCfg: {
+        speedVar: 0.075,
+        phaseVarSec: 0.55,
+        shearPx: 12,
+        rampSec: 28,
+      },
+
+      // DEBT system
+      crownCfg: {
+        debtDelaySec: 1.45,  // delay from collect -> shard spawns
+        debtCap: 5,          // max pending debts at once
+        shardLifeSec: 22,    // shard persists this long then expires
+        shardR: null,        // null => use player radius
       },
     },
   };
@@ -115,8 +143,13 @@
       samples: [],
     },
 
-    // afterimages: {samples, duration, bornAt, idx, x, y, seed}
+    // afterimages: {samples, duration, bornAt, idx, x, y, seed, id}
     afterimages: [],
+
+    // Crown shards (static hazards created by DEBT)
+    // shard: {x,y,r, bornAt, expiresAt}
+    shards: [],
+    debtQueue: [], // {x,y, dueAt}
 
     moment: {
       active: false,
@@ -150,7 +183,8 @@
     if (
       document.getElementById("btnSignal") &&
       document.getElementById("btnPressure") &&
-      document.getElementById("btnEntropy")
+      document.getElementById("btnEntropy") &&
+      document.getElementById("btnCrown")
     ) return;
 
     const box = document.createElement("div");
@@ -180,15 +214,18 @@
     const btnSignal = mkBtn("btnSignal", "START — SIGNAL (BASE)");
     const btnPressure = mkBtn("btnPressure", "START — PRESSURE (PHASE)");
     const btnEntropy = mkBtn("btnEntropy", "START — ENTROPY (DESYNC)");
+    const btnCrown = mkBtn("btnCrown", "START — CROWN (OVERCLOCK)");
 
     box.appendChild(btnSignal);
     box.appendChild(btnPressure);
     box.appendChild(btnEntropy);
+    box.appendChild(btnCrown);
     els.overlay.appendChild(box);
 
     btnSignal.addEventListener("click", () => startWithMode("signal"));
     btnPressure.addEventListener("click", () => startWithMode("pressure"));
     btnEntropy.addEventListener("click", () => startWithMode("entropy"));
+    btnCrown.addEventListener("click", () => startWithMode("crown"));
   }
 
   function showOverlay(show) {
@@ -349,6 +386,52 @@
     }
   }
 
+  // -------- Crown shards
+  function spawnShardAt(x, y) {
+    const cc = state.mode.crownCfg;
+    if (!cc) return;
+
+    const r = (cc.shardR == null) ? state.player.r : cc.shardR;
+    const bornAt = state.t;
+    const expiresAt = state.t + (cc.shardLifeSec || 22);
+
+    state.shards.push({ x, y, r, bornAt, expiresAt });
+
+    // Hard cap shards to avoid runaway (remove oldest)
+    const maxShards = 60;
+    if (state.shards.length > maxShards) {
+      state.shards.splice(0, state.shards.length - maxShards);
+    }
+  }
+
+  function updateCrownDebt() {
+    if (!state.mode.crown) return;
+
+    // Convert due debts into shards
+    while (state.debtQueue.length && state.debtQueue[0].dueAt <= state.t) {
+      const d = state.debtQueue.shift();
+      spawnShardAt(d.x, d.y);
+    }
+
+    // Expire old shards
+    if (state.shards.length) {
+      state.shards = state.shards.filter(s => s.expiresAt > state.t);
+    }
+  }
+
+  function collidePlayerWithShards() {
+    if (!state.shards.length) return false;
+
+    const px = state.player.x, py = state.player.y, pr = state.player.r;
+    for (const s of state.shards) {
+      const rr = pr + s.r;
+      const dx = s.x - px;
+      const dy = s.y - py;
+      if (dx * dx + dy * dy <= rr * rr) return true;
+    }
+    return false;
+  }
+
   function collidePlayerWithAfterimages() {
     const px = state.player.x, py = state.player.y, pr = state.player.r;
     const rr = pr + pr;
@@ -409,6 +492,15 @@
       }
       if (tooClose) continue;
 
+      // also avoid spawning directly on shards (Crown fairness)
+      for (const s2 of state.shards) {
+        const dx = s2.x - x;
+        const dy = s2.y - y;
+        const rr = (s2.r + COLLECT.momentRadius + 10);
+        if (dx * dx + dy * dy < rr * rr) { tooClose = true; break; }
+      }
+      if (tooClose) continue;
+
       return { x, y };
     }
 
@@ -427,6 +519,22 @@
     state.moment.expiresAt = state.nextSpawnAt;
   }
 
+  function enqueueDebtAtMoment(x, y) {
+    const cc = state.mode.crownCfg;
+    if (!cc) return;
+
+    // cap pending debts
+    if (state.debtQueue.length >= (cc.debtCap || 5)) return;
+
+    state.debtQueue.push({
+      x, y,
+      dueAt: state.t + (cc.debtDelaySec || 1.45),
+    });
+
+    // keep dueAt order
+    state.debtQueue.sort((a, b) => a.dueAt - b.dueAt);
+  }
+
   function tryCollectMoment() {
     if (!state.moment.active) return;
 
@@ -434,6 +542,10 @@
     const dy = state.player.y - state.moment.y;
     const rr = state.player.r + COLLECT.momentRadius;
     if (dx * dx + dy * dy > rr * rr) return;
+
+    // capture moment location BEFORE deactivating
+    const mx = state.moment.x;
+    const my = state.moment.y;
 
     state.moment.active = false;
     state.combo += 1;
@@ -447,6 +559,11 @@
 
     const pts = Math.round(COLLECT.basePoints * comboMult * earlyMult);
     state.score += pts;
+
+    // CROWN: Debt -> delayed shard at moment location (predictable, fair)
+    if (state.mode.crown) {
+      enqueueDebtAtMoment(mx, my);
+    }
   }
 
   // -------- Input → movement
@@ -507,6 +624,10 @@
 
     state.moment.active = false;
 
+    // Crown
+    state.shards = [];
+    state.debtQueue = [];
+
     state.player.x = state.view.w * 0.5;
     state.player.y = state.view.h * 0.5;
     state.player.vx = 0;
@@ -555,11 +676,13 @@
     }
 
     updateAfterimages();
+    updateCrownDebt();     // CROWN: debts -> shards, shard expiry
     updatePlayer(dt);
     recordSample();
     tryCollectMoment();
 
     if (collidePlayerWithAfterimages()) die();
+    if (collidePlayerWithShards()) die(); // CROWN hazards
   }
 
   // -------- Render
@@ -594,6 +717,40 @@
       ctx.beginPath();
       ctx.arc(g.x, g.y, state.player.r + 3, 0, Math.PI * 2);
       ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawShards() {
+    if (!state.shards.length) return;
+
+    for (const s of state.shards) {
+      const life = Math.max(0.0001, s.expiresAt - s.bornAt);
+      const age = clamp((state.t - s.bornAt) / life, 0, 1);
+      const a = 0.28 + 0.22 * Math.sin((state.t - s.bornAt) * 7.0);
+      const fade = 1 - age;
+
+      ctx.save();
+      ctx.globalAlpha = a * fade;
+      ctx.strokeStyle = "rgba(233,237,243,1)";
+      ctx.lineWidth = 1.5;
+
+      // diamond shard
+      const r = s.r + 6;
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y - r);
+      ctx.lineTo(s.x + r, s.y);
+      ctx.lineTo(s.x, s.y + r);
+      ctx.lineTo(s.x - r, s.y);
+      ctx.closePath();
+      ctx.stroke();
+
+      ctx.globalAlpha = (a * 0.55) * fade;
+      ctx.fillStyle = "rgba(233,237,243,1)";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+
       ctx.restore();
     }
   }
@@ -652,6 +809,7 @@
     clear();
     drawArena();
     drawAfterimages();
+    drawShards(); // crown hazards
     drawMoment();
     drawPlayer();
 
@@ -661,7 +819,8 @@
     const modeStr = state.mode.name;
 
     const speedStr = state.mode.phaseCompression ? `${replaySpeedMult().toFixed(2)}x` : "1.00x";
-    if (els.time) els.time.textContent = `${modeStr} (${speedStr}) • ${timeStr} • ${state.score} • ${comboStr}`;
+    const debtStr = state.mode.crown ? ` • DEBT ${state.debtQueue.length}` : "";
+    if (els.time) els.time.textContent = `${modeStr} (${speedStr}) • ${timeStr} • ${state.score} • ${comboStr}${debtStr}`;
 
     if (state.paused && !state.dead) {
       ctx.save();
@@ -689,6 +848,7 @@
     if (k === "Digit1") startWithMode("signal");
     if (k === "Digit2") startWithMode("pressure");
     if (k === "Digit3") startWithMode("entropy");
+    if (k === "Digit4") startWithMode("crown");
 
     if (k === "Space") {
       state.paused = !state.paused;
