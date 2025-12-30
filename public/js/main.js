@@ -1,646 +1,521 @@
-(() => {
-  const CFG = window.CONFIG;
+/* AFTERIMAGE — main.js (Entropy v1 added)
+   - Adds Entropy/Desync mode as deterministic desync on afterimage replay to prevent clump-cheese
+   - Supports optional multi-mode start buttons:
+       #btnStartSignal, #btnStartPressure, #btnStartEntropy
+     or buttons with [data-mode="signal|pressure|entropy"]
+*/
 
-  // -------- DOM
-  const canvas = document.getElementById("game");
-  const ctx = canvas.getContext("2d", { alpha: true });
+const CFG = (window.CONFIG || {});
+// ---- defaults (keeps old config working)
+CFG.gameplay = CFG.gameplay || {};
+CFG.visual = CFG.visual || {};
+CFG.controls = CFG.controls || {};
+// New: Entropy / Desync mode defaults
+CFG.gameplay.entropy = Object.assign(
+  {
+    enabled: false,
+    // how much each ghost's replay speed can vary (0.06 = ±6%)
+    speedVar: 0.06,
+    // seconds of phase offset range
+    phaseVarSec: 0.45,
+    // positional shear (px) applied perpendicular to ghost velocity
+    shearPx: 10,
+    // ramp to full entropy over N seconds
+    rampSec: 35,
+  },
+  (CFG.gameplay.entropy || {})
+);
 
-  const els = {
-    overlay: document.getElementById("overlay"),
-    btnStart: document.getElementById("btnStart"), // optional legacy
-    btnHow: document.getElementById("btnHow"),
-    how: document.getElementById("how"),
-    time: document.getElementById("time"),
-    hint: document.getElementById("hint"),
-    tLabel: document.getElementById("tLabel"),
-  };
+// Optional: mode presets if you want config-driven tuning
+CFG.modes = Object.assign(
+  {
+    signal: { entropy: false },
+    pressure: { entropy: false },
+    entropy: { entropy: true },
+  },
+  (CFG.modes || {})
+);
 
-  // -------- Modes (Signal = base, Pressure = phase compression)
-  // Keep Signal as the exact baseline: replay speed multiplier = 1.0 always
-  const MODES = {
-    signal: {
-      name: "SIGNAL",
-      phaseCompression: false,
-    },
-    pressure: {
-      name: "PRESSURE",
-      phaseCompression: true,
-      // Phase compression knobs:
-      // - rampPerSec: how fast replay speed increases per second of real time
-      // - maxMult: cap for fairness
-      // - graceSec: initial calm before ramp engages (optional)
-      rampPerSec: 0.0045, // ~ +0.27x per minute (0.0045*60=0.27)
-      maxMult: 1.55,
-      graceSec: 8,
-    },
-  };
+// Deterministic hash (no RNG). Used to desync ghosts in Entropy mode.
+function hashU32(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+function hashSamples(samples) {
+  // quantize to keep hash stable across minor float noise
+  let s = "";
+  const n = Math.min(samples.length, 900); // cap work
+  const step = Math.max(1, Math.floor(n / 300));
+  for (let i = 0; i < n; i += step) {
+    const p = samples[i];
+    s += ((p.x * 10) | 0) + "," + ((p.y * 10) | 0) + "," + ((p.t * 100) | 0) + ";";
+  }
+  return hashU32(s);
+}
 
-  // Score/collect system (v1.5)
-  const COLLECT = CFG.collect || {
-    momentRadius: 7,
-    basePoints: 100,
-    comboStep: 0.35,
-    comboCap: 10,
-    earlyBonusMax: 0.55,
-    minDistFromPlayer: 120,
-    minDistFromWalls: 30,
-    tries: 18,
-    dangerBias: 0.78,
-  };
+const els = {
+  canvas: document.getElementById("c"),
+  overlay: document.getElementById("overlay"),
+  btnStart: document.getElementById("btnStart"),
+  // optional multi-mode buttons
+  btnStartSignal: document.getElementById("btnStartSignal"),
+  btnStartPressure: document.getElementById("btnStartPressure"),
+  btnStartEntropy: document.getElementById("btnStartEntropy"),
+  btnHow: document.getElementById("btnHow"),
+  btnBack: document.getElementById("btnBack"),
+  panelHow: document.getElementById("panelHow"),
+  panelMain: document.getElementById("panelMain"),
+};
 
-  // -------- State
-  const state = {
-    view: { w: 0, h: 0, dpr: 1 },
+const ctx = els.canvas.getContext("2d", { alpha: false });
+
+function clamp(v, a, b) {
+  return Math.max(a, Math.min(b, v));
+}
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+function now() {
+  return performance.now() / 1000;
+}
+
+function resize() {
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const rect = els.canvas.getBoundingClientRect();
+  els.canvas.width = Math.floor(rect.width * dpr);
+  els.canvas.height = Math.floor(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+
+function showOverlay(on) {
+  els.overlay.style.display = on ? "flex" : "none";
+  els.overlay.setAttribute("aria-hidden", on ? "false" : "true");
+}
+function showHow(on) {
+  els.panelHow.style.display = on ? "block" : "none";
+  els.panelMain.style.display = on ? "none" : "block";
+}
+
+els.btnHow?.addEventListener("click", () => showHow(true));
+els.btnBack?.addEventListener("click", () => showHow(false));
+
+const state = {
+  t0: 0,
+  t: 0,
+  dt: 0,
+  last: 0,
+
+  // player
+  x: 0,
+  y: 0,
+  vx: 0,
+  vy: 0,
+
+  // input
+  ix: 0,
+  iy: 0,
+  keys: { up: false, down: false, left: false, right: false },
+
+  // replay recorder
+  record: [],
+  recordWindow: 5.0,
+
+  // afterimages
+  afterimages: [],
+  spawnEvery: (CFG.gameplay.spawnEverySec ?? 5.0),
+  spawnAt: 0,
+
+  // game
+  dead: false,
+
+  // mode: 'signal' | 'pressure' | 'entropy'
+  mode: (CFG.startMode || "signal"),
+  entropy: { enabled: false },
+
+  view: { w: 0, h: 0 },
+
+  // scoring / HUD
+  score: 0,
+  combo: 1,
+  lastCollectAt: 0,
+  pressure: 1.0, // used by your existing HUD if present
+  paused: false,
+};
+
+function resetState() {
+  const rect = els.canvas.getBoundingClientRect();
+  Object.assign(state, {
+    t0: now(),
     t: 0,
-    last: 0,
-    paused: false,
+    dt: 0,
+    last: now(),
+
+    x: rect.width * 0.5,
+    y: rect.height * 0.5,
+    vx: 0,
+    vy: 0,
+
+    ix: 0,
+    iy: 0,
+    keys: { up: false, down: false, left: false, right: false },
+
+    record: [],
+    recordWindow: (CFG.gameplay.recordWindowSec ?? 5.0),
+
+    afterimages: [],
+    spawnEvery: (CFG.gameplay.spawnEverySec ?? 5.0),
+    spawnAt: 0,
+
     dead: false,
+    paused: false,
 
-    // mode
-    modeKey: "signal",
-    mode: MODES.signal,
-
-    spawnEvery: CFG.gameplay.spawnEverySec,
-    nextSpawnAt: CFG.gameplay.spawnEverySec,
+    view: { w: rect.width, h: rect.height },
 
     score: 0,
-    combo: 0,
-
-    player: {
-      x: 0, y: 0,
-      vx: 0, vy: 0,
-      r: CFG.gameplay.playerRadius,
-    },
-
-    recorder: {
-      maxSec: CFG.gameplay.recordWindowSec,
-      samples: [],
-    },
-
-    afterimages: [], // {samples, duration, bornAt, idx, x, y}
-
-    moment: {
-      active: false,
-      x: 0, y: 0,
-      bornAt: 0,
-      expiresAt: 0, // B: expires exactly at next spawn
-    },
-
-    keys: new Set(),
-    pointer: { down: false, x: 0, y: 0 },
-  };
-
-  // -------- Canvas sizing
-  function resizeCanvas() {
-    const rect = canvas.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.floor(rect.width * dpr);
-    canvas.height = Math.floor(rect.height * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    state.view.w = rect.width;
-    state.view.h = rect.height;
-    state.view.dpr = dpr;
-  }
-
-  // -------- Overlay: create mode buttons if needed
-  function ensureModeButtons() {
-    if (!els.overlay) return;
-
-    // If already present, do nothing
-    if (document.getElementById("btnSignal") && document.getElementById("btnPressure")) return;
-
-    // Make a simple container
-    const box = document.createElement("div");
-    box.style.display = "flex";
-    box.style.flexDirection = "column";
-    box.style.gap = "10px";
-    box.style.alignItems = "center";
-    box.style.marginTop = "14px";
-
-    const mkBtn = (id, text) => {
-      const b = document.createElement("button");
-      b.id = id;
-      b.textContent = text;
-      b.style.cursor = "pointer";
-      b.style.padding = "10px 14px";
-      b.style.borderRadius = "12px";
-      b.style.border = "1px solid rgba(233,237,243,.25)";
-      b.style.background = "rgba(0,0,0,.35)";
-      b.style.color = "rgba(233,237,243,.92)";
-      b.style.font = "600 14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
-      b.style.letterSpacing = ".08em";
-      b.onmouseenter = () => (b.style.background = "rgba(233,237,243,.10)");
-      b.onmouseleave = () => (b.style.background = "rgba(0,0,0,.35)");
-      return b;
-    };
-
-    const btnSignal = mkBtn("btnSignal", "START — SIGNAL (BASE)");
-    const btnPressure = mkBtn("btnPressure", "START — PRESSURE (PHASE)");
-
-    box.appendChild(btnSignal);
-    box.appendChild(btnPressure);
-
-    els.overlay.appendChild(box);
-
-    btnSignal.addEventListener("click", () => {
-      startWithMode("signal");
-    });
-    btnPressure.addEventListener("click", () => {
-      startWithMode("pressure");
-    });
-  }
-
-  function showOverlay(show) {
-    if (!els.overlay) return;
-    els.overlay.style.display = show ? "flex" : "none";
-  }
-
-  function setHow(show) {
-    if (!els.how) return;
-    els.how.style.display = show ? "" : "none";
-  }
-
-  if (els.btnHow) {
-    els.btnHow.addEventListener("click", () => {
-      const isOpen = els.how && els.how.style.display !== "none";
-      setHow(!isOpen);
-    });
-  }
-
-  // Legacy single start button (optional)
-  if (els.btnStart) {
-    els.btnStart.addEventListener("click", () => startWithMode("signal"));
-  }
-
-  // -------- Helpers
-  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-  function hypot(x, y) { return Math.hypot(x, y); }
-  function randBetween(a, b) { return a + Math.random() * (b - a); }
-
-  function wallBounds() {
-    const pad = CFG.gameplay.wallPadding;
-    return {
-      minX: pad,
-      minY: pad,
-      maxX: state.view.w - pad,
-      maxY: state.view.h - pad,
-    };
-  }
-
-  // -------- Recorder
-  function recordSample() {
-    const t = state.t;
-    const s = state.recorder.samples;
-    s.push({ t, x: state.player.x, y: state.player.y });
-
-    const cutoff = t - state.recorder.maxSec;
-    while (s.length && s[0].t < cutoff) s.shift();
-  }
-
-  // -------- Spawn afterimage
-  function spawnAfterimage() {
-    const s = state.recorder.samples;
-    if (s.length < 2) return;
-
-    const startT = s[0].t;
-    const duration = s[s.length - 1].t - startT;
-    if (duration <= 0.05) return;
-
-    const samples = s.map(p => ({
-      t: p.t - startT,
-      x: p.x,
-      y: p.y,
-    }));
-
-    state.afterimages.push({
-      samples,
-      duration,
-      bornAt: state.t,
-      idx: 0,
-      x: samples[0].x,
-      y: samples[0].y,
-    });
-  }
-
-  // -------- Phase compression: compute replay speed multiplier
-  function replaySpeedMult() {
-    if (!state.mode.phaseCompression) return 1.0;
-    const m = state.mode;
-
-    const tEff = Math.max(0, state.t - (m.graceSec || 0));
-    const mult = 1.0 + tEff * (m.rampPerSec || 0);
-    return clamp(mult, 1.0, m.maxMult || 1.5);
-  }
-
-  function updateAfterimages() {
-    const speed = replaySpeedMult();
-
-    for (const g of state.afterimages) {
-      // 핵심: local time runs faster under phase compression
-      const local = ((state.t - g.bornAt) * speed) % g.duration;
-
-      while (g.idx < g.samples.length - 2 && g.samples[g.idx + 1].t < local) {
-        g.idx++;
-      }
-
-      const a = g.samples[g.idx];
-      const b = g.samples[Math.min(g.idx + 1, g.samples.length - 1)];
-      const span = Math.max(0.0001, b.t - a.t);
-      const u = clamp((local - a.t) / span, 0, 1);
-
-      g.x = a.x + (b.x - a.x) * u;
-      g.y = a.y + (b.y - a.y) * u;
-    }
-  }
-
-  function collidePlayerWithAfterimages() {
-    const px = state.player.x, py = state.player.y, pr = state.player.r;
-    const rr = pr + pr;
-    const rr2 = rr * rr;
-
-    for (const g of state.afterimages) {
-      const dx = g.x - px;
-      const dy = g.y - py;
-      if (dx * dx + dy * dy <= rr2) return true;
-    }
-    return false;
-  }
-
-  // -------- Moment (B expiry)
-  function expireMomentIfNeeded() {
-    if (!state.moment.active) return false;
-    if (state.t < state.moment.expiresAt) return false;
-
-    state.moment.active = false;
-    if (state.combo > 0) state.combo = 0;
-    return true;
-  }
-
-  function dangerWeightedSpawn() {
-    const b = wallBounds();
-    const hasDanger = state.afterimages.length > 0;
-
-    for (let i = 0; i < COLLECT.tries; i++) {
-      let x, y;
-
-      const useDanger = hasDanger && Math.random() < COLLECT.dangerBias;
-
-      if (useDanger) {
-        const g = state.afterimages[Math.floor(Math.random() * state.afterimages.length)];
-        const ang = Math.random() * Math.PI * 2;
-        const dist = randBetween(state.player.r * 2.0, COLLECT.minDistFromPlayer * 1.35);
-        x = g.x + Math.cos(ang) * dist;
-        y = g.y + Math.sin(ang) * dist;
-      } else {
-        x = randBetween(b.minX, b.maxX);
-        y = randBetween(b.minY, b.maxY);
-      }
-
-      x = clamp(x, b.minX + COLLECT.minDistFromWalls, b.maxX - COLLECT.minDistFromWalls);
-      y = clamp(y, b.minY + COLLECT.minDistFromWalls, b.maxY - COLLECT.minDistFromWalls);
-
-      const dp = hypot(x - state.player.x, y - state.player.y);
-      if (dp < COLLECT.minDistFromPlayer) continue;
-
-      // avoid instant unfair overlap with ghosts
-      let tooClose = false;
-      const mr = COLLECT.momentRadius + state.player.r + 10;
-      const mr2 = mr * mr;
-      for (const g2 of state.afterimages) {
-        const dx = g2.x - x;
-        const dy = g2.y - y;
-        if (dx * dx + dy * dy < mr2) { tooClose = true; break; }
-      }
-      if (tooClose) continue;
-
-      return { x, y };
-    }
-
-    return {
-      x: randBetween(b.minX + 40, b.maxX - 40),
-      y: randBetween(b.minY + 40, b.maxY - 40),
-    };
-  }
-
-  function spawnMoment() {
-    const pos = dangerWeightedSpawn();
-    state.moment.active = true;
-    state.moment.x = pos.x;
-    state.moment.y = pos.y;
-    state.moment.bornAt = state.t;
-    state.moment.expiresAt = state.nextSpawnAt; // B: expires at next spawn
-  }
-
-  function tryCollectMoment() {
-    if (!state.moment.active) return;
-
-    const dx = state.player.x - state.moment.x;
-    const dy = state.player.y - state.moment.y;
-    const rr = state.player.r + COLLECT.momentRadius;
-    if (dx * dx + dy * dy > rr * rr) return;
-
-    state.moment.active = false;
-    state.combo += 1;
-
-    const streak = Math.min(state.combo, COLLECT.comboCap);
-    const comboMult = 1 + (streak - 1) * COLLECT.comboStep;
-
-    const window = Math.max(0.0001, state.moment.expiresAt - state.moment.bornAt);
-    const fracLeft = clamp((state.moment.expiresAt - state.t) / window, 0, 1);
-    const earlyMult = 1 + fracLeft * COLLECT.earlyBonusMax;
-
-    const pts = Math.round(COLLECT.basePoints * comboMult * earlyMult);
-    state.score += pts;
-  }
-
-  // -------- Input → movement
-  function axisFromKeys() {
-    const k = state.keys;
-    const ax = {
-      x: (k.has("ArrowRight") || k.has("KeyD") ? 1 : 0) - (k.has("ArrowLeft") || k.has("KeyA") ? 1 : 0),
-      y: (k.has("ArrowDown") || k.has("KeyS") ? 1 : 0) - (k.has("ArrowUp") || k.has("KeyW") ? 1 : 0),
-    };
-
-    if (state.pointer.down) {
-      const dx = state.pointer.x - state.player.x;
-      const dy = state.pointer.y - state.player.y;
-      const d = hypot(dx, dy);
-      if (d > 12) {
-        ax.x += dx / d;
-        ax.y += dy / d;
-      }
-    }
-
-    const m = hypot(ax.x, ax.y);
-    if (m > 0.001) { ax.x /= m; ax.y /= m; }
-    return ax;
-  }
-
-  function updatePlayer(dt) {
-    const ax = axisFromKeys();
-    const spd = CFG.gameplay.playerSpeed;
-
-    state.player.vx = ax.x * spd;
-    state.player.vy = ax.y * spd;
-
-    state.player.x += state.player.vx * dt;
-    state.player.y += state.player.vy * dt;
-
-    const b = wallBounds();
-    state.player.x = clamp(state.player.x, b.minX, b.maxX);
-    state.player.y = clamp(state.player.y, b.minY, b.maxY);
-  }
-
-  // -------- Game loop
-  function reset() {
-    resizeCanvas();
-
-    state.t = 0;
-    state.last = performance.now();
-    state.paused = false;
-    state.dead = false;
-
-    state.afterimages = [];
-    state.recorder.samples = [];
-
-    state.spawnEvery = CFG.gameplay.spawnEverySec;
-    state.nextSpawnAt = state.spawnEvery;
-
-    state.score = 0;
-    state.combo = 0;
-
-    state.moment.active = false;
-
-    state.player.x = state.view.w * 0.5;
-    state.player.y = state.view.h * 0.5;
-    state.player.vx = 0;
-    state.player.vy = 0;
-
-    if (els.tLabel) els.tLabel.textContent = state.spawnEvery.toFixed(1);
-    if (els.hint && CFG.ui.showHintDuringPlay) els.hint.style.display = "";
-  }
-
-  function startWithMode(key) {
-    state.modeKey = key;
-    state.mode = MODES[key] || MODES.signal;
-    reset();
+    combo: 1,
+    lastCollectAt: 0,
+    pressure: 1.0,
+  });
+}
+
+let currentMode = state.mode || "signal";
+
+function applyMode(mode) {
+  currentMode = mode || "signal";
+  state.mode = currentMode;
+  const preset = CFG.modes && CFG.modes[currentMode] ? CFG.modes[currentMode] : null;
+
+  // base gameplay knobs (these already exist in config.js; keep defaults if missing)
+  const baseSpawn =
+    (CFG.gameplay && typeof CFG.gameplay.spawnEverySec === "number") ? CFG.gameplay.spawnEverySec : 5.0;
+
+  // Mode mapping:
+  // - signal: your clean baseline
+  // - pressure: your phase-compression mode (keeps your existing pressure tuning via config.js)
+  // - entropy: pressure + deterministic desync to prevent clump-cheese
+  state.entropy.enabled = !!(preset && preset.entropy);
+
+  // Optional per-mode spawn tweaks (safe defaults)
+  if (currentMode === "signal") state.spawnEvery = baseSpawn;
+  if (currentMode === "pressure") state.spawnEvery = baseSpawn; // keep your pressure tuning external
+  if (currentMode === "entropy") state.spawnEvery = Math.max(2.2, baseSpawn * 0.9);
+}
+
+// input
+window.addEventListener("keydown", (e) => {
+  if (e.code === "ArrowUp" || e.code === "KeyW") state.keys.up = true;
+  if (e.code === "ArrowDown" || e.code === "KeyS") state.keys.down = true;
+  if (e.code === "ArrowLeft" || e.code === "KeyA") state.keys.left = true;
+  if (e.code === "ArrowRight" || e.code === "KeyD") state.keys.right = true;
+
+  if (e.code === "KeyR") {
     showOverlay(false);
+    start(currentMode);
+  }
+  if (e.code === "Space") {
+    state.paused = !state.paused;
+  }
+});
+
+window.addEventListener("keyup", (e) => {
+  if (e.code === "ArrowUp" || e.code === "KeyW") state.keys.up = false;
+  if (e.code === "ArrowDown" || e.code === "KeyS") state.keys.down = false;
+  if (e.code === "ArrowLeft" || e.code === "KeyA") state.keys.left = false;
+  if (e.code === "ArrowRight" || e.code === "KeyD") state.keys.right = false;
+});
+
+// pointer controls
+els.canvas.addEventListener("pointerdown", (e) => {
+  els.canvas.setPointerCapture(e.pointerId);
+});
+els.canvas.addEventListener("pointermove", (e) => {
+  // optional: if your v1 uses pointer steering, keep it here.
+  // (not forcing changes—just preserving hook)
+});
+
+// --------- core loop
+function start(mode) {
+  resetState();
+  applyMode(mode || currentMode);
+
+  resize();
+  state.last = now();
+  state.spawnAt = state.spawnEvery;
+
+  requestAnimationFrame(frame);
+}
+
+function frame() {
+  const t = now();
+  state.dt = Math.min(0.05, t - state.last);
+  state.last = t;
+
+  if (!state.paused && !state.dead) {
+    state.t = t - state.t0;
+    step(state.dt);
   }
 
-  function die() {
-    state.dead = true;
-    showOverlay(true);
-    if (els.hint) els.hint.style.display = "none";
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// --------- gameplay mechanics
+function step(dt) {
+  stepInput(dt);
+  stepPlayer(dt);
+  stepRecorder();
+  stepAfterimages();
+  checkDeath();
+}
+
+function stepInput(dt) {
+  let ax = 0,
+    ay = 0;
+  if (state.keys.left) ax -= 1;
+  if (state.keys.right) ax += 1;
+  if (state.keys.up) ay -= 1;
+  if (state.keys.down) ay += 1;
+
+  // normalize
+  const m = Math.hypot(ax, ay) || 1;
+  ax /= m;
+  ay /= m;
+
+  // knobs (use your existing config if present)
+  const accel = (CFG.controls.accel ?? 1600);
+  const maxV = (CFG.controls.maxV ?? 520);
+  const friction = (CFG.controls.friction ?? 0.86);
+
+  state.vx = (state.vx + ax * accel * dt) * friction;
+  state.vy = (state.vy + ay * accel * dt) * friction;
+
+  const sp = Math.hypot(state.vx, state.vy);
+  if (sp > maxV) {
+    const k = maxV / sp;
+    state.vx *= k;
+    state.vy *= k;
+  }
+}
+
+function stepPlayer(dt) {
+  state.x += state.vx * dt;
+  state.y += state.vy * dt;
+
+  const pad = (CFG.gameplay.boundsPad ?? 18);
+  state.x = clamp(state.x, pad, state.view.w - pad);
+  state.y = clamp(state.y, pad, state.view.h - pad);
+}
+
+function stepRecorder() {
+  // record the player's path with timestamps relative to now (state.t)
+  state.record.push({ x: state.x, y: state.y, t: state.t });
+
+  // drop old samples outside the recordWindow
+  const cutoff = state.t - state.recordWindow;
+  while (state.record.length && state.record[0].t < cutoff) state.record.shift();
+}
+
+function spawnAfterimage() {
+  const samples = state.record.slice();
+  const seed = hashSamples(samples) ^ (state.afterimages.length * 2654435761);
+
+  if (samples.length < 2) return;
+
+  const bornAt = state.t;
+  const duration = state.recordWindow;
+
+  state.afterimages.push({
+    bornAt,
+    duration,
+    samples,
+    seed,
+    idx: state.afterimages.length,
+    x: samples[0].x,
+    y: samples[0].y,
+  });
+}
+
+function stepAfterimages() {
+  // spawn
+  state.spawnAt -= state.dt;
+  if (state.spawnAt <= 0) {
+    spawnAfterimage();
+    state.spawnAt += state.spawnEvery;
   }
 
-  function update(dt) {
-    if (state.paused || state.dead) return;
+  // step positions
+  for (let i = 0; i < state.afterimages.length; i++) {
+    const g = state.afterimages[i];
 
-    state.t += dt;
+    let local = state.t - g.bornAt;
 
-    // expire moment window first (B rule)
-    expireMomentIfNeeded();
+    // --- Entropy / Desync (deterministic, no RNG)
+    // Prevents 'clump-cheese' by making each ghost slightly out-of-phase and sheared
+    // based on its recorded path + index.
+    if (state.entropy && state.entropy.enabled) {
+      const e = CFG.gameplay.entropy;
+      const ramp = Math.min(1, local / Math.max(1e-6, e.rampSec));
+      const a = ramp;
 
-    // Spawn cadence
-    if (state.t >= state.nextSpawnAt) {
-      spawnAfterimage();
+      // speed var in ±speedVar
+      const speed = 1 + (Math.sin((g.seed * 0.00007) + (g.idx * 1.618)) * e.speedVar * a);
+      // phase offset in seconds
+      const phase = (Math.sin((g.seed * 0.00011) + (g.idx * 0.73)) * e.phaseVarSec * a);
 
-      state.nextSpawnAt = state.t + state.spawnEvery;
-
-      if (CFG.gameplay.rampEnabled) {
-        state.spawnEvery = Math.max(
-          CFG.gameplay.spawnEveryMinSec,
-          state.spawnEvery - CFG.gameplay.rampDeltaSec
-        );
-      }
-      if (els.tLabel) els.tLabel.textContent = state.spawnEvery.toFixed(1);
-
-      spawnMoment();
+      local = local * speed + phase;
     }
 
-    updateAfterimages();
-    updatePlayer(dt);
-    recordSample();
-    tryCollectMoment();
+    if (local < 0) local = 0;
 
-    if (collidePlayerWithAfterimages()) die();
+    // time along the recorded window [0..duration]
+    const tt = (local % g.duration) + (g.samples[0].t);
+    // find segment
+    let j = 0;
+    while (j < g.samples.length - 2 && g.samples[j + 1].t < tt) j++;
+
+    const a = g.samples[j];
+    const b = g.samples[j + 1];
+    const span = Math.max(1e-6, b.t - a.t);
+    const u = clamp((tt - a.t) / span, 0, 1);
+
+    let gx = a.x + (b.x - a.x) * u;
+    let gy = a.y + (b.y - a.y) * u;
+
+    if (state.entropy && state.entropy.enabled) {
+      const e = CFG.gameplay.entropy;
+      // velocity direction (for perpendicular shear)
+      const vx = b.x - a.x;
+      const vy = b.y - a.y;
+      const vmag = Math.hypot(vx, vy) || 1;
+      const px = -vy / vmag;
+      const py = vx / vmag;
+
+      // Shear strength ramps with time since this ghost was born
+      const local2 = Math.max(0, (state.t - g.bornAt));
+      const ramp = Math.min(1, local2 / Math.max(1e-6, e.rampSec));
+      const wob = Math.sin((local2 * 1.9) + (g.idx * 0.91) + (g.seed * 0.00005));
+      const shear = e.shearPx * ramp * wob;
+
+      gx += px * shear;
+      gy += py * shear;
+    }
+
+    g.x = gx;
+    g.y = gy;
   }
 
-  // -------- Render
-  function clear() {
-    ctx.clearRect(0, 0, state.view.w, state.view.h);
+  // trim old ghosts if your config wants it (optional)
+  const maxGhosts = (CFG.gameplay.maxAfterimages ?? 60);
+  if (state.afterimages.length > maxGhosts) {
+    state.afterimages.splice(0, state.afterimages.length - maxGhosts);
   }
+}
 
-  function drawArena() {
-    const b = wallBounds();
-    ctx.save();
-    ctx.globalAlpha = 0.85;
-    ctx.strokeStyle = "rgba(233,237,243,.12)";
+function checkDeath() {
+  // collision: touch any ghost point = end
+  const pr = (CFG.gameplay.playerR ?? 8);
+  const gr = (CFG.gameplay.ghostR ?? 8);
+  const rr = pr + gr;
+
+  for (const g of state.afterimages) {
+    const dx = g.x - state.x;
+    const dy = g.y - state.y;
+    if (dx * dx + dy * dy <= rr * rr) {
+      state.dead = true;
+      showOverlay(true);
+      return;
+    }
+  }
+}
+
+// --------- rendering
+function draw() {
+  const w = state.view.w;
+  const h = state.view.h;
+
+  // background
+  ctx.fillStyle = (CFG.visual.bg ?? "#0b0b0d");
+  ctx.fillRect(0, 0, w, h);
+
+  // subtle vignette / frame
+  if (CFG.visual.frame !== false) {
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
     ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(b.minX - 14, b.minY - 14, (b.maxX - b.minX) + 28, (b.maxY - b.minY) + 28, 18);
-    ctx.stroke();
-    ctx.restore();
+    ctx.strokeRect(10, 10, w - 20, h - 20);
   }
 
-  function drawAfterimages() {
-    for (const g of state.afterimages) {
-      ctx.save();
-      ctx.globalAlpha = 0.18;
-      ctx.fillStyle = "rgba(233,237,243,1)";
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, state.player.r, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.globalAlpha = 0.08;
-      ctx.strokeStyle = "rgba(233,237,243,1)";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, state.player.r + 3, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  function drawMoment() {
-    if (!state.moment.active) return;
-
-    const r = COLLECT.momentRadius;
-    const pulse = 0.5 + 0.5 * Math.sin(state.t * 6.0);
-    const a = 0.55 + 0.25 * pulse;
-
-    ctx.save();
-    ctx.translate(state.moment.x, state.moment.y);
-
-    ctx.globalAlpha = a;
-    ctx.strokeStyle = "rgba(233,237,243,1)";
-    ctx.lineWidth = 1.5;
-
+  // afterimages
+  const ghostAlpha = (CFG.visual.ghostAlpha ?? 0.35);
+  ctx.fillStyle = `rgba(255, 200, 120, ${ghostAlpha})`;
+  const gr = (CFG.gameplay.ghostR ?? 8);
+  for (const g of state.afterimages) {
     ctx.beginPath();
-    ctx.moveTo(0, -r - 2);
-    ctx.lineTo(r + 2, 0);
-    ctx.lineTo(0, r + 2);
-    ctx.lineTo(-r - 2, 0);
-    ctx.closePath();
-    ctx.stroke();
-
-    ctx.globalAlpha = a * 0.8;
-    ctx.fillStyle = "rgba(233,237,243,1)";
-    ctx.beginPath();
-    ctx.arc(0, 0, 1.8 + pulse * 0.8, 0, Math.PI * 2);
+    ctx.arc(g.x, g.y, gr, 0, Math.PI * 2);
     ctx.fill();
-
-    ctx.restore();
   }
 
-  function drawPlayer() {
-    const p = state.player;
+  // player
+  const pr = (CFG.gameplay.playerR ?? 8);
+  ctx.fillStyle = (CFG.visual.playerColor ?? "#f6f0e8");
+  ctx.beginPath();
+  ctx.arc(state.x, state.y, pr, 0, Math.PI * 2);
+  ctx.fill();
 
-    ctx.save();
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = "rgba(233,237,243,1)";
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-    ctx.fill();
+  // HUD
+  ctx.fillStyle = "rgba(240,220,200,0.85)";
+  ctx.font = "14px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
 
-    ctx.globalAlpha = 0.08;
-    ctx.strokeStyle = "rgba(233,237,243,1)";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r + 8, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
+  const label =
+    (currentMode === "entropy") ? "ENTROPY" :
+    (currentMode === "pressure") ? "PRESSURE" :
+    "SIGNAL";
+
+  ctx.fillText(`TIME`, 16, 14);
+  ctx.fillText(`${state.t.toFixed(2)}`, 16, 32);
+  ctx.fillText(`${label}`, 16, 52);
+
+  if (state.paused) {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(240,220,200,0.7)";
+    ctx.font = "16px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    ctx.fillText("PAUSED", w / 2, h / 2);
   }
+}
 
-  function render() {
-    clear();
-    drawArena();
-    drawAfterimages();
-    drawMoment();
-    drawPlayer();
-
-    // HUD
-    const timeStr = state.t.toFixed(2);
-    const comboStr = state.combo > 0 ? `x${state.combo}` : "—";
-    const modeStr = state.mode.name;
-    const speedStr = state.mode.phaseCompression ? `${replaySpeedMult().toFixed(2)}x` : "1.00x";
-    if (els.time) els.time.textContent = `${modeStr} (${speedStr}) • ${timeStr} • ${state.score} • ${comboStr}`;
-
-    if (state.paused && !state.dead) {
-      ctx.save();
-      ctx.fillStyle = "rgba(0,0,0,.35)";
-      ctx.fillRect(0, 0, state.view.w, state.view.h);
-      ctx.fillStyle = "rgba(233,237,243,.85)";
-      ctx.font = "600 18px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
-      ctx.textAlign = "center";
-      ctx.fillText("PAUSED", state.view.w / 2, state.view.h / 2);
-      ctx.restore();
-    }
-  }
-
-  // -------- Events
-  window.addEventListener("resize", () => resizeCanvas());
-
-  window.addEventListener("keydown", (e) => {
-    const k = e.code;
-
-    if (k === "KeyR") {
-      startWithMode(state.modeKey); // restart same mode
-      return;
-    }
-
-    if (k === "Digit1") startWithMode("signal");
-    if (k === "Digit2") startWithMode("pressure");
-
-    if (k === "Space") {
-      state.paused = !state.paused;
-      e.preventDefault();
-      return;
-    }
-
-    state.keys.add(k);
+// Start buttons:
+// - supports legacy single button (#btnStart)
+// - supports multi-mode buttons if present:
+//   #btnStartSignal, #btnStartPressure, #btnStartEntropy
+//   OR any button with [data-mode="signal|pressure|entropy"]
+function bindStartButton(el, mode) {
+  if (!el) return;
+  el.addEventListener("click", () => {
+    showOverlay(false);
+    start(mode);
   });
+}
 
-  window.addEventListener("keyup", (e) => {
-    state.keys.delete(e.code);
-  });
+bindStartButton(els.btnStartSignal, "signal");
+bindStartButton(els.btnStartPressure, "pressure");
+bindStartButton(els.btnStartEntropy, "entropy");
 
-  canvas.addEventListener("pointerdown", (e) => {
-    state.pointer.down = true;
-    const rect = canvas.getBoundingClientRect();
-    state.pointer.x = e.clientX - rect.left;
-    state.pointer.y = e.clientY - rect.top;
-  });
+// data-mode fallback (lets you add buttons in HTML without changing JS)
+document.querySelectorAll("[data-mode]").forEach((btn) => {
+  bindStartButton(btn, btn.getAttribute("data-mode") || "signal");
+});
 
-  window.addEventListener("pointermove", (e) => {
-    if (!state.pointer.down) return;
-    const rect = canvas.getBoundingClientRect();
-    state.pointer.x = e.clientX - rect.left;
-    state.pointer.y = e.clientY - rect.top;
-  });
+// legacy single button behavior
+bindStartButton(els.btnStart, currentMode);
 
-  window.addEventListener("pointerup", () => {
-    state.pointer.down = false;
-  });
-
-  // -------- RAF
-  function tick(now) {
-    if (!state.last) state.last = now;
-    const dt = clamp((now - state.last) / 1000, 0, 0.033);
-    state.last = now;
-
-    update(dt);
-    render();
-
-    requestAnimationFrame(tick);
-  }
-
-  // -------- Boot
-  resizeCanvas();
-  ensureModeButtons();
-  showOverlay(true);
-  setHow(true);
-
-  requestAnimationFrame(tick);
-})();
+// boot
+resize();
+showOverlay(true);
+showHow(false);
