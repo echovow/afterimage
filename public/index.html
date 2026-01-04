@@ -11,7 +11,7 @@
   <main id="app" aria-label="Afterimage game">
     <canvas id="game" width="960" height="540" aria-label="Game canvas"></canvas>
 
-    <!-- Minimal HUD -->
+    <!-- Minimal overlay: readable, not intrusive -->
     <div id="hud" role="status" aria-live="polite">
       <div class="hud-left">
         <div class="label">TIME</div>
@@ -27,227 +27,41 @@
       </div>
     </div>
 
-    <!-- Overlay (Start + How + End) -->
-    <div id="overlay" class="overlay isDim">
-      <div class="panel fadeIn" id="panelRoot">
+    <!-- Start / Death screen -->
+    <div id="overlay" class="overlay">
+      <div class="panel">
+        <div class="title">AFTERIMAGE</div>
+        <div class="subtitle">Your last seconds return. Survive yourself.</div>
 
-        <!-- HOME PANEL -->
-        <section id="homePanel" class="panel-section">
-          <header class="home-head">
-            <div class="title">AFTERIMAGE</div>
+        <div class="rules">
+          <div class="rule"><span class="dot"></span> Every <span id="tLabel">5.0</span>s, an afterimage spawns.</div>
+          <div class="rule"><span class="dot"></span> It replays exactly what you did.</div>
+          <div class="rule"><span class="dot"></span> Touch one = end.</div>
+        </div>
 
-            <div class="subtitle subtitle-strong">
-              Your last seconds return.<br />
-              Survive yourself.
-            </div>
+        <div class="cta">
+          <button id="btnStart" class="btn primary">PLAY</button>
+          <button id="btnHow" class="btn">HOW</button>
+        </div>
 
-            <div class="rules">
-              <div class="rule"><span class="dot"></span> Every <span id="tLabel">5.0</span>s, an afterimage spawns.</div>
-              <div class="rule"><span class="dot"></span> It replays exactly what you did.</div>
-              <div class="rule"><span class="dot"></span> Touch one — end.</div>
-            </div>
+        <div id="how" class="how hidden">
+          <p>
+            Move clean. Your motion becomes terrain.
+            The better you are, the denser the future gets.
+          </p>
+          <p class="small">
+            Tip: play smaller. Leave space for your ghosts.
+          </p>
+        </div>
 
-            <div class="home-facts">
-              No randomness.<br />
-              No power-ups.<br />
-              Only position, timing, and pressure.
-            </div>
-          </header>
-
-          <div class="home-grid">
-            <!-- MODE LADDER -->
-            <aside class="modes">
-              <div class="modes-label">MODES</div>
-
-              <button class="modeBtn" data-mode="signal" id="btnModeSignal" type="button">
-                <div class="modeTop">START — SIGNAL <span class="modeTag">(BASE)</span></div>
-                <div class="modeSub">Learn the shape of your movement.</div>
-              </button>
-
-              <button class="modeBtn" data-mode="pressure" id="btnModePressure" type="button">
-                <div class="modeTop">START — PRESSURE <span class="modeTag">(PHASE)</span></div>
-                <div class="modeSub">Time compresses. Mistakes close faster.</div>
-              </button>
-
-              <button class="modeBtn" data-mode="entropy" id="btnModeEntropy" type="button">
-                <div class="modeTop">START — ENTROPY <span class="modeTag">(DESYNC)</span></div>
-                <div class="modeSub">Your past stops agreeing with itself.</div>
-              </button>
-
-              <button class="modeBtn crown" data-mode="crown" id="btnModeCrown" type="button">
-                <div class="modeTop">START — CROWN <span class="modeTag">(OVERCLOCK)</span></div>
-                <div class="modeSub">Nothing forgives. Everything stacks.</div>
-              </button>
-
-              <div class="home-actions">
-                <!-- Keep btnStart for compatibility with existing main.js -->
-                <button id="btnStart" class="btn primary" type="button">PLAY</button>
-                <button id="btnHow" class="btn" type="button">HOW</button>
-              </div>
-
-              <!-- Pump.fun placeholder -->
-              <a id="pumpLink" href="#" target="_blank" rel="noopener noreferrer" aria-label="External signal">
-                SIGNAL PERSISTS →
-              </a>
-            </aside>
-          </div>
-
-          <div class="footer small">
-            Built for web arcade. No RNG. No excuses.
-          </div>
-        </section>
-
-        <!-- HOW PANEL -->
-        <section id="howPanel" class="panel-section hidden" aria-label="How it works">
-          <div class="howHead">
-            <div class="howTitle">HOW IT WORKS</div>
-            <button id="btnHowClose" class="btn ghost" type="button" aria-label="Close tutorial">CLOSE</button>
-          </div>
-
-          <div class="howBody">
-            <p><strong>MOVE.</strong><br />Your movement is recorded.</p>
-
-            <p>Every <strong>5 seconds</strong>, an afterimage spawns.<br />
-              It replays <strong>exactly</strong> what you did.</p>
-
-            <p>Touch one — <strong>end</strong>.</p>
-
-            <p class="howRule">There is no randomness.<br />There are no upgrades.</p>
-
-            <p class="howHook">Space closes because <strong>you filled it</strong>.</p>
-
-            <div class="howControls">
-              <div class="howControlsLabel">CONTROLS</div>
-              <div class="howControlsRow"><span class="key">WASD</span>/<span class="key">ARROWS</span> Move</div>
-              <div class="howControlsRow"><span class="key">R</span> Restart</div>
-              <div class="howControlsRow"><span class="key">ESC</span> Pause / Exit</div>
-            </div>
-          </div>
-
-          <div class="howFooter">
-            <button id="btnHowBack" class="btn primary" type="button">BACK</button>
-          </div>
-        </section>
-
-        <!-- END PANEL -->
-        <section id="endPanel" class="panel-section hidden" aria-label="Run ended">
-          <div class="endWrap">
-            <div class="endVerdict" id="endVerdict">You touched yourself.</div>
-
-            <div class="endExplain" id="endExplain">
-              An afterimage replayed your movement.<br />
-              Position collapsed. The run ended.
-            </div>
-
-            <div class="endStats" aria-label="Run stats">
-              <div class="statRow">
-                <div class="statLabel">TIME SURVIVED</div>
-                <div class="statValue" id="endTime">00:00</div>
-              </div>
-              <div class="statRow">
-                <div class="statLabel">AFTERIMAGES</div>
-                <div class="statValue" id="endAfter">0</div>
-              </div>
-              <div class="statRow">
-                <div class="statLabel">MODE</div>
-                <div class="statValue" id="endMode">SIGNAL</div>
-              </div>
-              <div class="statRow">
-                <div class="statLabel">SCORE</div>
-                <div class="statValue" id="endScore">0</div>
-              </div>
-              <div class="statRow hidden" id="endMultRow">
-                <div class="statLabel">MULTIPLIER</div>
-                <div class="statValue" id="endMult">x1.00</div>
-              </div>
-            </div>
-
-            <div class="endReflect"><em>Nothing here was random.</em></div>
-
-            <div class="endActions">
-              <button id="btnRestart" class="btn primary restartBtn" type="button">RESTART</button>
-              <button id="btnChangeMode" class="btn" type="button">CHANGE MODE</button>
-            </div>
-
-            <!-- Pump.fun placeholder on end screen (quiet) -->
-            <a id="pumpLinkEnd" href="#" target="_blank" rel="noopener noreferrer" aria-label="External signal">
-              Follow the signal →
-            </a>
-          </div>
-        </section>
-
+        <div class="footer small">
+          Built for web arcade. No RNG. No excuses.
+        </div>
       </div>
     </div>
   </main>
 
   <script src="./js/config.js"></script>
   <script src="./js/main.js"></script>
-
-  <!-- Lightweight UI wiring (does not require editing main.js) -->
-  <script>
-    (function(){
-      const $ = (id)=>document.getElementById(id);
-
-      const homePanel = $("homePanel");
-      const howPanel  = $("howPanel");
-      const endPanel  = $("endPanel");
-
-      const btnHow = $("btnHow");
-      const btnHowClose = $("btnHowClose");
-      const btnHowBack = $("btnHowBack");
-
-      const btnRestart = $("btnRestart");
-      const btnChangeMode = $("btnChangeMode");
-
-      // Persisted mode (placeholder integration; main.js may already use it)
-      function setMode(mode){
-        try { localStorage.setItem("afterimage_mode", mode); } catch(e){}
-        document.documentElement.dataset.mode = mode;
-      }
-
-      // Mode buttons: set localStorage mode, then "PLAY" via btnStart
-      document.querySelectorAll(".modeBtn").forEach(btn=>{
-        btn.addEventListener("click", ()=>{
-          const mode = btn.getAttribute("data-mode") || "signal";
-          setMode(mode);
-          // If your main.js listens to #btnStart, this keeps compatibility.
-          const start = $("btnStart");
-          if (start) start.click();
-        });
-      });
-
-      // HOW panel toggle
-      function showHow(){
-        homePanel.classList.add("hidden");
-        endPanel.classList.add("hidden");
-        howPanel.classList.remove("hidden");
-      }
-      function showHome(){
-        howPanel.classList.add("hidden");
-        endPanel.classList.add("hidden");
-        homePanel.classList.remove("hidden");
-      }
-
-      if (btnHow) btnHow.addEventListener("click", showHow);
-      if (btnHowClose) btnHowClose.addEventListener("click", showHome);
-      if (btnHowBack) btnHowBack.addEventListener("click", showHome);
-
-      // End panel buttons:
-      // Restart triggers the same behavior as pressing "R"
-      if (btnRestart) btnRestart.addEventListener("click", ()=>{
-        const ev = new KeyboardEvent("keydown", { key: "r", code: "KeyR", bubbles: true });
-        window.dispatchEvent(ev);
-        document.dispatchEvent(ev);
-      });
-
-      if (btnChangeMode) btnChangeMode.addEventListener("click", showHome);
-
-      // Default mode marker (for CSS hooks later)
-      try {
-        const m = localStorage.getItem("afterimage_mode");
-        if (m) document.documentElement.dataset.mode = m;
-      } catch(e){}
-    })();
-  </script>
 </body>
 </html>
